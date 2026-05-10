@@ -2,12 +2,12 @@ name: stock-mover-alert
 
 on:
   schedule:
-    # Every 15 minutes during US regular trading hours, Mon-Fri.
+    # US regular trading hours, Mon-Fri.
     # Cron is in UTC. We cover both EDT (UTC-4) and EST (UTC-5):
     #   EDT regular hours 09:30-16:00 ET == 13:30-20:00 UTC
     #   EST regular hours 09:30-16:00 ET == 14:30-21:00 UTC
-    # Union: 13:30-21:00 UTC. The script no-ops outside ET market hours
-    # because data won't update meaningfully, so over-coverage is fine.
+    # Union: 13:30-21:00 UTC. Outside ET market hours quotes barely move,
+    # so over-coverage is fine.
     - cron: '*/15 13-20 * * 1-5'
     - cron: '0,15,30,45 21 * * 1-5'
   workflow_dispatch: {}
@@ -27,16 +27,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set trading day
+      - name: Compute trading day key
         id: day
         run: echo "key=$(TZ=America/New_York date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
 
       - name: Restore alert state
         id: state-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: state
-          key: alert-state-${{ steps.day.outputs.key }}
+          key: alert-state-${{ steps.day.outputs.key }}-final
+          restore-keys: |
+            alert-state-${{ steps.day.outputs.key }}-
 
       - name: Set up Python
         uses: actions/setup-python@v5
