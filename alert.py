@@ -9,6 +9,10 @@ Triggers (per US trading day):
 De-duplication: each (ticker, trigger-type) is only sent once per ET trading
 day. State is persisted in state/alerted-YYYY-MM-DD.json and cached between
 GitHub Actions runs via actions/cache (keyed by date).
+
+Market-hours guard: the script only sends alerts during NYSE regular trading
+hours on actual NYSE trading days (so weekends, US market holidays, and the
+early-close half-days are all respected automatically).
 """
 from __future__ import annotations
 
@@ -43,6 +47,40 @@ def now_et() -> datetime:
 
 def trading_day_key() -> str:
     return now_et().strftime("%Y-%m-%d")
+
+
+def is_market_open(now: datetime | None = None) -> bool:
+    """Return True only during NYSE regular trading hours on a real NYSE trading day.
+
+    Uses pandas_market_calendars to handle US market holidays and the
+    early-close half-days (e.g. day after Thanksgiving, Christmas Eve)
+    which close at 13:00 ET.
+    """
+    if now is None:
+        now = now_et()
+
+    try:
+        import pandas_market_calendars as mcal
+        nyse = mcal.get_calendar("NYSE")
+        sched = nyse.schedule(
+            start_date=now.date().isoformat(),
+            end_date=now.date().isoformat(),
+        )
+        if sched.empty:
+            return False  # weekend or full holiday
+        # market_open / market_close are tz-aware (UTC); compare directly
+        market_open = sched.iloc[0]["market_open"].to_pydatetime()
+        market_close = sched.iloc[0]["market_close"].to_pydatetime()
+        return market_open <= now <= market_close
+    except Exception as e:
+        # Fallback: weekday + 09:30-16:00 ET, no holiday awareness.
+        print(f"[warn] pandas_market_calendars unavailable ({e}); "
+              "falling back to weekday 09:30-16:00 ET check", file=sys.stderr)
+        if now.weekday() >= 5:
+            return False
+        open_t = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        close_t = now.replace(hour=16, minute=0, second=0, microsecond=0)
+        return open_t <= now <= close_t
 
 
 def fetch_quote(ticker: str):
@@ -114,7 +152,7 @@ def fmt_pct(p):
 def build_stock_message(ticker, last, prev, pct):
     arrow = "🚀" if pct > 0 else "🔻"
     return (
-        f"{arrow} *{ticker}* moved *{fmt_pct(pct)}* intraday  "
+        f"{arrow} *{ticker}* moved *{fmt_pct(pct)}* intraday "
         f"(last ${last:.2f} vs prev close ${prev:.2f})"
     )
 
@@ -136,6 +174,10 @@ def main() -> int:
     if not webhook:
         print("[err] SLACK_WEBHOOK_URL not set", file=sys.stderr)
         return 2
+
+    if not is_market_open():
+        print(f"[skip] market closed at {now_et().isoformat()}; no alerts will be sent")
+        return 0
 
     day_key = trading_day_key()
     alerted = load_state(day_key)
