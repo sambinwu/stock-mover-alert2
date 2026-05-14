@@ -3,11 +3,12 @@ or when both S&P 500 and Nasdaq Composite move sharply in the same direction.
 
 Triggers (per US trading day):
   * Any watched ticker's intraday % change vs. previous close has |%| > 5
-    - During market hours, "intraday %" uses the live last price.
-    - After-hours / on cron-runs that miss market hours, we fall back to
-      the day's high and low vs. previous close, so a move that happened
-      during the day still alerts even if GitHub Actions skipped the
-      relevant 15-minute slot.
+    AND one of the following is also true:
+      - |%| > 5 was sustained for MORE THAN 60 cumulative minutes during the
+        regular session (measured on 1-minute bars), OR
+      - The session's closing price itself is still |%| > 5 vs. previous close.
+    A brief spike above 5% that quickly retraces (and does not close >5%) does
+    NOT alert.
   * Both ^GSPC and ^IXIC are simultaneously up > 1.5%, OR
   * Both ^GSPC and ^IXIC are simultaneously down > 1%
 
@@ -39,9 +40,13 @@ WATCHLIST = [
 SP500 = "^GSPC"
 NASDAQ_COMP = "^IXIC"
 
-STOCK_THRESHOLD_PCT = 5.0       # |move| > 5%
-INDEX_UP_THRESHOLD_PCT = 1.5    # both indices up >1.5%
-INDEX_DOWN_THRESHOLD_PCT = 1.0  # both indices down >1%
+STOCK_THRESHOLD_PCT = 5.0          # |move| > 5%
+INDEX_UP_THRESHOLD_PCT = 1.5       # both indices up >1.5%
+INDEX_DOWN_THRESHOLD_PCT = 1.0     # both indices down >1%
+
+# A >5% move must persist for MORE THAN this many cumulative minutes during the
+# session to qualify as a "sustained" alert. (Non-consecutive minutes count.)
+SUSTAINED_MINUTES_REQUIRED = 60
 
 STATE_DIR = Path("state")
 ET = ZoneInfo("America/New_York")
@@ -96,8 +101,7 @@ def fetch_quote(ticker: str):
     """Return (last_price, prev_close, day_high, day_low).
 
     Uses yfinance fast_info for the live last and previous close, plus
-    the day's high/low (needed for the after-hours fallback). Any field
-    that can't be resolved comes back as None.
+    the day's high/low. Any field that can't be resolved comes back as None.
     """
     last = None
     prev = None
@@ -147,22 +151,74 @@ def pct_change(cur, prev):
     return (cur - prev) / prev * 100.0
 
 
-def best_extreme_pct(last, prev, day_high, day_low):
-    """Return the signed % move that is largest in absolute value among
-    intraday-last, day-high, day-low (each measured vs. previous close).
+def evaluate_sustained_and_close(ticker: str, prev_close):
+    """Inspect today's 1-minute bars and decide whether the >5% rule fires.
 
-    This is what we compare against STOCK_THRESHOLD_PCT, so a move that
-    peaked at 13:00 ET still triggers an alert when the script runs at
-    18:11 ET because GitHub Actions skipped the earlier cron slot.
+    Returns a dict:
+      {
+        "sustained_minutes": int,          # cumulative minutes today with
+                                           #   |pct| > STOCK_THRESHOLD_PCT
+        "sustained_peak_pct": float|None,  # signed % at the single most
+                                           #   extreme qualifying minute
+        "ref_price_sustained": float|None, # price at that minute
+        "is_session_closed": bool,         # True if a 15:59 ET (or later) bar
+                                           #   is present, i.e. we have the close
+        "close_pct": float|None,           # signed % of the last bar vs prev
+        "ref_price_close": float|None,     # price of the last bar
+      }
     """
-    candidates = []
-    for cur in (last, day_high, day_low):
-        p = pct_change(cur, prev)
-        if p is not None:
-            candidates.append(p)
-    if not candidates:
-        return None
-    return max(candidates, key=abs)
+    out = {
+        "sustained_minutes": 0,
+        "sustained_peak_pct": None,
+        "ref_price_sustained": None,
+        "is_session_closed": False,
+        "close_pct": None,
+        "ref_price_close": None,
+    }
+    if prev_close is None or prev_close == 0:
+        return out
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period="1d", interval="1m",
+                         auto_adjust=False, prepost=False)
+        if hist is None or hist.empty:
+            return out
+
+        # Normalize index timezone to ET.
+        idx = hist.index
+        if idx.tz is None:
+            hist.index = idx.tz_localize("UTC").tz_convert(ET)
+        else:
+            hist.index = idx.tz_convert(ET)
+
+        today = now_et().date()
+        hist = hist[hist.index.date == today]
+        if hist.empty:
+            return out
+
+        closes = hist["Close"].astype(float)
+        pcts = (closes - prev_close) / prev_close * 100.0
+
+        # Sustained: cumulative minutes where |pct| > threshold.
+        over = pcts[pcts.abs() > STOCK_THRESHOLD_PCT]
+        out["sustained_minutes"] = int(len(over))
+        if not over.empty:
+            peak_idx = over.abs().idxmax()
+            out["sustained_peak_pct"] = float(over.loc[peak_idx])
+            out["ref_price_sustained"] = float(closes.loc[peak_idx])
+
+        # Closing-price check: the 1-min bar labeled 15:59 ET covers the
+        # final minute of the regular session, so its Close is effectively
+        # the session close.
+        last_ts = hist.index[-1]
+        if last_ts.time() >= dtime(15, 59):
+            out["is_session_closed"] = True
+            out["close_pct"] = float(pcts.iloc[-1])
+            out["ref_price_close"] = float(closes.iloc[-1])
+    except Exception as e:
+        print(f"[warn] evaluate_sustained_and_close {ticker} failed: {e}",
+              file=sys.stderr)
+    return out
 
 
 def load_state(day_key: str):
@@ -245,27 +301,50 @@ def main() -> int:
         if prev is None:
             continue
 
-        # Best (largest |%|) of last / day-high / day-low vs prev close.
-        pct = best_extreme_pct(last, prev, day_high, day_low)
-        if pct is None:
+        # New rule: a >5% move alone is NOT enough.
+        # We require EITHER cumulative-minutes-above-5% > 60 during the
+        # session, OR the closing price itself still > 5% off prev close.
+        info = evaluate_sustained_and_close(ticker, prev)
+
+        sustained_fired = (
+            info["sustained_minutes"] > SUSTAINED_MINUTES_REQUIRED
+            and info["sustained_peak_pct"] is not None
+        )
+        close_fired = (
+            info["is_session_closed"]
+            and info["close_pct"] is not None
+            and abs(info["close_pct"]) > STOCK_THRESHOLD_PCT
+        )
+
+        if not (sustained_fired or close_fired):
+            # Touched 5% but neither sustained >60 cumulative minutes nor
+            # closed >5% off prev close -> do not alert.
+            print(f"[info] {ticker}: no alert "
+                  f"(sustained_minutes={info['sustained_minutes']}, "
+                  f"is_session_closed={info['is_session_closed']}, "
+                  f"close_pct={info['close_pct']})")
             continue
 
-        if abs(pct) > STOCK_THRESHOLD_PCT:
-            live_pct = pct_change(last, prev)
-            intraday_peak = (
-                live_pct is None or abs(live_pct) <= STOCK_THRESHOLD_PCT
-            )
-            if intraday_peak:
-                ref_price = day_high if pct > 0 else day_low
-            else:
-                ref_price = last
+        # Prefer the close-based message once the bell has rung; otherwise
+        # report the sustained-peak move.
+        if close_fired:
+            pct = info["close_pct"]
+            ref_price = info["ref_price_close"]
             if ref_price is None:
                 ref_price = last if last is not None else prev
-            new_alerts.append(
-                build_stock_message(ticker, ref_price, prev, pct,
-                                    intraday_peak=intraday_peak)
-            )
-            alerted.add(key)
+            intraday_peak = False  # this IS the close
+        else:
+            pct = info["sustained_peak_pct"]
+            ref_price = info["ref_price_sustained"]
+            if ref_price is None:
+                ref_price = last if last is not None else prev
+            intraday_peak = True   # sustained peak during the session
+
+        new_alerts.append(
+            build_stock_message(ticker, ref_price, prev, pct,
+                                intraday_peak=intraday_peak)
+        )
+        alerted.add(key)
 
     sp_last, sp_prev, _, _ = fetch_quote(SP500)
     nq_last, nq_prev, _, _ = fetch_quote(NASDAQ_COMP)
