@@ -248,10 +248,10 @@ def evaluate_sustained_and_close(ticker: str, prev_close):
         if hist.empty:
             return out
 
-        closes = hist["Close"].astype(float)
-        pcts = (closes - prev_close) / prev_close * 100.0
+        closes = hist["Close"].astype(float); highs = hist["High"].astype(float); lows = hist["Low"].astype(float)
+        pcts = (closes - prev_close) / prev_close * 100.0; high_pcts = (highs - prev_close) / prev_close * 100.0; low_pcts = (lows - prev_close) / prev_close * 100.0; bar_peak_pct = high_pcts.where(high_pcts.abs() >= low_pcts.abs(), low_pcts)
 
-        over = pcts[pcts.abs() > STOCK_THRESHOLD_PCT]
+        over = bar_peak_pct[bar_peak_pct.abs() >= STOCK_THRESHOLD_PCT]
         out["sustained_minutes"] = int(len(over))
         if not over.empty:
             peak_idx = over.abs().idxmax()
@@ -377,13 +377,13 @@ def main() -> int:
         info = evaluate_sustained_and_close(ticker, prev)
 
         sustained_fired = (
-            info["sustained_minutes"] > SUSTAINED_MINUTES_REQUIRED
+            info["sustained_minutes"] >= SUSTAINED_MINUTES_REQUIRED
             and info["sustained_peak_pct"] is not None
         )
         close_fired = (
             info["is_session_closed"]
             and info["close_pct"] is not None
-            and abs(info["close_pct"]) > STOCK_THRESHOLD_PCT
+            and abs(info["close_pct"]) >= STOCK_THRESHOLD_PCT
         )
 
         if not (sustained_fired or close_fired):
