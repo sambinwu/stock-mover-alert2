@@ -9,9 +9,8 @@ on:
     # Union: 13:30-21:00 UTC. The Python script (alert.py) further
     # gates execution with an NYSE calendar check, so US market
     # holidays and early-close half-days are also respected.
-    - cron: '*/15 13-20 * * 1-5'
-    - cron: '0,15,30,45 21 * * 1-5'
-  workflow_dispatch: {}
+        - cron: '*/5 13-21 * * 1-5'
+    workflow_dispatch: {}
 
 permissions:
   contents: read
