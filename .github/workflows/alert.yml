@@ -6,10 +6,10 @@ on:
     # Cron is in UTC. We cover both EDT (UTC-4) and EST (UTC-5):
     #   EDT regular hours 09:30-16:00 ET == 13:30-20:00 UTC
     #   EST regular hours 09:30-16:00 ET == 14:30-21:00 UTC
-    # Union: 13:30-21:00 UTC. The Python script (alert.py) further
+        # Union: 13:30-20:00 UTC (covers regular session EDT + EST). The Python script (alert.py)
     # gates execution with an NYSE calendar check, so US market
     # holidays and early-close half-days are also respected.
-        - cron: '*/5 13-21 * * 1-5'
+            - cron: '*/5 13-20 * * 1-5'
     workflow_dispatch: {}
 
 permissions:
