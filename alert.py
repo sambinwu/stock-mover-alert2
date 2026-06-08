@@ -4,7 +4,7 @@ or when both S&P 500 and Nasdaq Composite move sharply in the same direction.
 Triggers (per US trading day):
   * Any watched ticker's intraday % change vs. previous close has |%| > 5
     AND one of the following is also true:
-      - |%| > 5 was sustained for MORE THAN 120 cumulative minutes during the
+      - |%| > 5 was sustained for MORE THAN 90 cumulative minutes during the
         regular session (measured on 1-minute bars), OR
       - The session's closing price itself is still |%| > 5 vs. previous close.
     A brief spike above 5% that quickly retraces (and does not close >5%) does
@@ -53,7 +53,7 @@ INDEX_DOWN_THRESHOLD_PCT = 1.0     # both indices down >1%
 
 # A >5% move must persist for MORE THAN this many cumulative minutes during the
 # session to qualify as a "sustained" alert. (Non-consecutive minutes count.)
-SUSTAINED_MINUTES_REQUIRED = 120
+SUSTAINED_MINUTES_REQUIRED = 90
 
 # If fast_info['previous_close'] disagrees with the daily-bar Close by more
 # than this percent, emit a [warn] line so the divergence is auditable.
