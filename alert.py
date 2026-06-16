@@ -172,7 +172,7 @@ def resolve_prev_close(ticker: str):
         t = yf.Ticker(ticker)
         # 7 calendar days easily covers weekends + any 3-day holiday gap.
         start_dt = (now_et().date() - timedelta(days=7)).isoformat()
-           hist = t.history(start=start_dt, interval="1d", auto_adjust=False)
+        hist = t.history(start=start_dt, interval="1d", auto_adjust=False)
         if hist is None or hist.empty:
             return None, None
 
