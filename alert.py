@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import datetime, date, time as dtime
+from datetime import datetime, date, time as dtime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -170,8 +170,9 @@ def resolve_prev_close(ticker: str):
     """
     try:
         t = yf.Ticker(ticker)
-        # 10 calendar days easily covers weekends + any 3-day holiday gap.
-        hist = t.history(period="10d", interval="1d", auto_adjust=False)
+        # 7 calendar days easily covers weekends + any 3-day holiday gap.
+        start_dt = (now_et().date() - timedelta(days=7)).isoformat()
+           hist = t.history(start=start_dt, interval="1d", auto_adjust=False)
         if hist is None or hist.empty:
             return None, None
 
