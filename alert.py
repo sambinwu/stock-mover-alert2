@@ -180,9 +180,9 @@ def resolve_prev_close(ticker: str):
         dates: list[date] = []
         for d in idx:
             try:
-                # If tz-aware, convert to ET so the "date" matches NYSE sessions.
+                # Daily bars: the index date IS the trading day; take it as-is.
                 if getattr(d, "tzinfo", None) is not None:
-                    dates.append(d.tz_convert(ET).date())
+                    dates.append(d.date())
                 else:
                     dates.append(d.date())
             except Exception:
