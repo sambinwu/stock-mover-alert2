@@ -367,7 +367,7 @@ def main() -> int:
         # Authoritative prior-trading-day Close from daily bars.
         prev, prev_date = resolve_prev_close(ticker)
         _audit_prev_close(ticker, fi_prev, prev)
-        if prev is None or (fi_prev is not None and fi_prev > 0 and abs(prev - fi_prev) / fi_prev > 0.01):
+        if prev is None:
             # Last-resort fallback: only used if daily history is totally unavailable.
             prev = fi_prev
         if prev is None:
@@ -407,7 +407,7 @@ def main() -> int:
             if ref_price is None:
                 ref_price = last if last is not None else prev
             intraday_peak = True
-
+        
         new_alerts.append(
             build_stock_message(ticker, ref_price, prev, pct,
                                 intraday_peak=intraday_peak,
@@ -422,10 +422,10 @@ def main() -> int:
     nq_prev, nq_prev_date = resolve_prev_close(NASDAQ_COMP)
     _audit_prev_close(SP500, sp_fi_prev, sp_prev)
     _audit_prev_close(NASDAQ_COMP, nq_fi_prev, nq_prev)
-    if sp_prev is None or (sp_fi_prev is not None and sp_fi_prev > 0 and abs(sp_prev - sp_fi_prev) / sp_fi_prev > 0.01):
-        sp_prev = sp_fi_prev
-    if nq_prev is None or (nq_fi_prev is not None and nq_fi_prev > 0 and abs(nq_prev - nq_fi_prev) / nq_fi_prev > 0.01):
-        nq_prev = nq_fi_prev
+        if sp_prev is None:      
+            sp_prev = sp_fi_prev
+        if nq_prev is None:        
+            nq_prev = nq_fi_prev
 
     sp_pct = pct_change(sp_last, sp_prev)
     nq_pct = pct_change(nq_last, nq_prev)
