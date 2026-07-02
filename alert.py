@@ -422,10 +422,10 @@ def main() -> int:
     nq_prev, nq_prev_date = resolve_prev_close(NASDAQ_COMP)
     _audit_prev_close(SP500, sp_fi_prev, sp_prev)
     _audit_prev_close(NASDAQ_COMP, nq_fi_prev, nq_prev)
-        if sp_prev is None:      
-            sp_prev = sp_fi_prev
-        if nq_prev is None:        
-            nq_prev = nq_fi_prev
+    if sp_prev is None:      
+        sp_prev = sp_fi_prev
+    if nq_prev is None:        
+        nq_prev = nq_fi_prev
 
     sp_pct = pct_change(sp_last, sp_prev)
     nq_pct = pct_change(nq_last, nq_prev)
