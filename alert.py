@@ -42,7 +42,7 @@ import yfinance as yf
 
 WATCHLIST = [
     "NVDA", "META", "TSLA", "PLTR", "MSFT", "TEM", "TSM",
-    "NFLX", "GOOGL", "AMZN", "GS", "COST", "INTC", "ORCL", "AAPL", "SNOW"
+    "NFLX", "GOOGL", "AMZN", "GS", "COST", "INTC", "ORCL", "AAPL", "SNOW", "HOOD", "SPCX"
 ]
 SP500 = "^GSPC"
 NASDAQ_COMP = "^IXIC"
