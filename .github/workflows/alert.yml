@@ -2,14 +2,20 @@ name: stock-mover-alert
 
 on:
   schedule:
-    # US regular trading hours, Mon-Fri.
-    # Cron is in UTC. We cover both EDT (UTC-4) and EST (UTC-5):
-    #   EDT regular hours 09:30-16:00 ET == 13:30-20:00 UTC
-    #   EST regular hours 09:30-16:00 ET == 14:30-21:00 UTC
-            # Union: 13:30-21:00 UTC (EDT closes at UTC 20:00; EST closes at UTC 21:00 -- must cover both).
-    # gates execution with an NYSE calendar check, so US market
-    # holidays and early-close half-days are also respected.
-    - cron: '*/5 13-21 * * 1-5'
+    # GitHub schedules each cron ENTRY independently and silently drops slots
+    # when the hosted scheduler is under load. A single tight '*/5' line was
+    # observed producing only 1-3 runs per day (2026-08-28: one run all day),
+    # which is how a real move can go unreported for a whole session.
+    #
+    # So: two offset intraday entries instead of one tight one, plus a dense
+    # after-close net. Cron is UTC. Regular hours, EDT/EST union, are
+    # 13:30-21:00 UTC (EDT 09:30-16:00 == 13:30-20:00; EST == 14:30-21:00).
+    - cron: '*/15 13-21 * * 1-5'
+    - cron: '7-59/15 13-21 * * 1-5'
+    # After the close the session's numbers are final, so these are the runs
+    # that matter most -- 16:00-19:45 ET and 20:00-21:45 ET.
+    - cron: '*/15 20-23 * * 1-5'
+    - cron: '*/15 0-1 * * 2-6'
   workflow_dispatch: {}
 
 permissions:
@@ -39,6 +45,7 @@ jobs:
           key: alert-state-${{ steps.day.outputs.key }}-final
           restore-keys: |
             alert-state-${{ steps.day.outputs.key }}-
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -49,6 +56,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
       - name: Run alert
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
