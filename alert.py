@@ -12,12 +12,23 @@ Triggers (per US trading day):
   * Both ^GSPC and ^IXIC are simultaneously up > 1.5%, OR
   * Both ^GSPC and ^IXIC are simultaneously down > 1%
 
-"Previous close" is resolved from the daily-OHLC history (interval='1d'):
-specifically, the Close of the most recent NYSE trading day strictly before
-today (ET). yfinance's fast_info['previous_close'] has been observed to
-return a stale value on some days, so we treat the daily-bar Close as the
-authoritative reference. fast_info is only used as a last-resort fallback
-if the daily-bar query fails outright.
+"Previous close" resolution
+---------------------------
+The reference close MUST be the close of the exact previous NYSE session --
+never "whatever the most recent daily bar happens to be". Yahoo has been
+observed to serve daily OHLC bars where an entire session is null/missing
+(e.g. Fri 2026-08-28 came back empty for most tickers). The old code walked
+back to the next-most-recent bar, silently comparing against a close from two
+sessions ago; that produced a bogus -8.26% HOOD alert and swallowed a real
++5.5% TSLA move on the same day.
+
+So now:
+  1. The expected previous session date comes from the NYSE calendar.
+  2. We take the daily bar for THAT EXACT DATE.
+  3. If it is missing/NaN, we rebuild that day's close from intraday bars.
+  4. If that also fails, we fall back to fast_info['previous_close'].
+  5. If everything fails we SKIP the ticker. We never substitute an older
+     session's close.
 
 De-duplication: each (ticker, trigger-type) is only sent once per ET trading
 day. State is persisted in state/alerted-YYYY-MM-DD.json and cached between
@@ -31,6 +42,7 @@ safety net for cron slots GitHub Actions failed to schedule on time.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from datetime import datetime, date, time as dtime, timedelta
@@ -42,21 +54,23 @@ import yfinance as yf
 
 WATCHLIST = [
     "NVDA", "META", "TSLA", "PLTR", "MSFT", "TEM", "TSM",
-    "NFLX", "GOOGL", "AMZN", "GS", "COST", "INTC", "ORCL", "AAPL", "SNOW", "HOOD", "SPCX"
+    "NFLX", "GOOGL", "AMZN", "GS", "COST", "INTC", "ORCL", "AAPL", "SNOW",
+    "HOOD", "SPCX", "SHOP"
 ]
 SP500 = "^GSPC"
 NASDAQ_COMP = "^IXIC"
 
-STOCK_THRESHOLD_PCT = 5.0          # |move| > 5%
-INDEX_UP_THRESHOLD_PCT = 1.5       # both indices up >1.5%
-INDEX_DOWN_THRESHOLD_PCT = 1.0     # both indices down >1%
+STOCK_THRESHOLD_PCT = 5.0        # |move| > 5%
+INDEX_UP_THRESHOLD_PCT = 1.5     # both indices up >1.5%
+INDEX_DOWN_THRESHOLD_PCT = 1.0   # both indices down >1%
 
 # A >5% move must persist for MORE THAN this many cumulative minutes during the
 # session to qualify as a "sustained" alert. (Non-consecutive minutes count.)
 SUSTAINED_MINUTES_REQUIRED = 90
 
-# If fast_info['previous_close'] disagrees with the daily-bar Close by more
-# than this percent, emit a [warn] line so the divergence is auditable.
+# If fast_info['previous_close'] disagrees with the resolved previous-session
+# close by more than this percent, emit a [warn] line so the divergence is
+# auditable.
 PREV_CLOSE_DRIFT_WARN_PCT = 0.05
 
 STATE_DIR = Path("state")
@@ -71,6 +85,16 @@ def trading_day_key() -> str:
     return now_et().strftime("%Y-%m-%d")
 
 
+def _nyse_sessions(start: date, end: date) -> list[date]:
+    """NYSE session dates in [start, end], or [] if the calendar is unusable."""
+    import pandas_market_calendars as mcal
+    nyse = mcal.get_calendar("NYSE")
+    sched = nyse.schedule(start_date=start.isoformat(), end_date=end.isoformat())
+    if sched.empty:
+        return []
+    return [ts.date() for ts in sched.index]
+
+
 def is_trading_day(now: datetime | None = None) -> bool:
     """Return True if `now` falls on a real NYSE trading day.
 
@@ -82,17 +106,34 @@ def is_trading_day(now: datetime | None = None) -> bool:
     if now is None:
         now = now_et()
     try:
-        import pandas_market_calendars as mcal
-        nyse = mcal.get_calendar("NYSE")
-        sched = nyse.schedule(
-            start_date=now.date().isoformat(),
-            end_date=now.date().isoformat(),
-        )
-        return not sched.empty
+        return bool(_nyse_sessions(now.date(), now.date()))
     except Exception as e:
         print(f"[warn] pandas_market_calendars unavailable ({e}); "
               "falling back to weekday check", file=sys.stderr)
         return now.weekday() < 5
+
+
+def previous_trading_day(today: date | None = None) -> date | None:
+    """The most recent NYSE session strictly before `today`.
+
+    This is the single source of truth for which date the alert compares
+    against. Never infer it from whatever bars a data provider happened to
+    return.
+    """
+    if today is None:
+        today = now_et().date()
+    try:
+        sessions = _nyse_sessions(today - timedelta(days=12),
+                                  today - timedelta(days=1))
+        if sessions:
+            return sessions[-1]
+    except Exception as e:
+        print(f"[warn] previous_trading_day: calendar unavailable ({e}); "
+              "falling back to weekday arithmetic", file=sys.stderr)
+    d = today - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
 
 
 def is_regular_hours(now: datetime | None = None) -> bool:
@@ -108,12 +149,29 @@ def is_regular_hours(now: datetime | None = None) -> bool:
     return dtime(9, 30) <= now.time() <= dtime(16, 0)
 
 
+def _is_num(x) -> bool:
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return False
+    return not math.isnan(f) and f > 0
+
+
+def _to_et_index(hist):
+    idx = hist.index
+    if idx.tz is None:
+        hist.index = idx.tz_localize("UTC").tz_convert(ET)
+    else:
+        hist.index = idx.tz_convert(ET)
+    return hist
+
+
 def fetch_quote(ticker: str):
     """Return (last_price, prev_close_fast_info, day_high, day_low).
 
-    The second value is yfinance fast_info['previous_close'], which is NOT
-    authoritative -- it has been observed to return a stale value (e.g. the
-    Close from two sessions ago) on some days. Always prefer resolve_prev_close().
+    The second value is yfinance fast_info['previous_close']. It is only a
+    fallback for resolve_prev_close(); it has been observed stale on some
+    days, so it is never the primary reference.
     """
     last = None
     prev = None
@@ -157,49 +215,92 @@ def fetch_quote(ticker: str):
     return last, prev, day_high, day_low
 
 
-def resolve_prev_close(ticker: str):
-    """Return (prev_close, prev_close_date) for the most recent NYSE trading
-    day strictly before today (ET).
-
-    Uses daily-OHLC bars (interval='1d') and picks the most recent bar whose
-    date is < today. This is the authoritative prior-trading-day close;
-    yfinance's fast_info['previous_close'] is unreliable and should not be
-    used for the alert comparison.
-
-    Returns (None, None) on failure.
-    """
+def daily_closes(ticker: str) -> dict[date, float]:
+    """{session date -> close} from daily OHLC bars. NaN/empty rows dropped."""
+    out: dict[date, float] = {}
     try:
         t = yf.Ticker(ticker)
-        # 7 calendar days easily covers weekends + any 3-day holiday gap.
-        start_dt = (now_et().date() - timedelta(days=7)).isoformat()
+        start_dt = (now_et().date() - timedelta(days=14)).isoformat()
         hist = t.history(start=start_dt, interval="1d", auto_adjust=False)
         if hist is None or hist.empty:
-            return None, None
-
-        idx = hist.index
-        dates: list[date] = []
-        for d in idx:
+            return out
+        for stamp, close in zip(hist.index, hist["Close"].tolist()):
+            if not _is_num(close):
+                continue
             try:
-                # Daily bars: the index date IS the trading day; take it as-is.
-                if getattr(d, "tzinfo", None) is not None:
-                    dates.append(d.date())
-                else:
-                    dates.append(d.date())
+                d = stamp.date()
             except Exception:
-                # Fall back to pydatetime path
-                dates.append(d.to_pydatetime().date())
-
-        closes = [float(c) for c in hist["Close"].tolist()]
-        today = now_et().date()
-
-        for d, c in zip(reversed(dates), reversed(closes)):
-            if d < today:
-                return c, d
-        return None, None
+                d = stamp.to_pydatetime().date()
+            out[d] = float(close)
     except Exception as e:
-        print(f"[warn] resolve_prev_close {ticker} failed: {e}",
+        print(f"[warn] daily_closes {ticker} failed: {e}", file=sys.stderr)
+    return out
+
+
+def close_from_intraday(ticker: str, day: date) -> float | None:
+    """Rebuild `day`'s regular-session close from intraday bars.
+
+    Used when the daily bar for that exact session is missing or NaN. Yahoo
+    retains 1m bars for ~30 days and 30m/1h bars for ~60 days, which comfortably
+    covers "yesterday".
+    """
+    for interval in ("30m", "1h", "1m"):
+        try:
+            t = yf.Ticker(ticker)
+            hist = t.history(start=day.isoformat(),
+                             end=(day + timedelta(days=1)).isoformat(),
+                             interval=interval, auto_adjust=False, prepost=False)
+            if hist is None or hist.empty:
+                continue
+            hist = _to_et_index(hist)
+            hist = hist[hist.index.date == day]
+            hist = hist[[_is_num(c) for c in hist["Close"].tolist()]]
+            if hist.empty:
+                continue
+            close = float(hist["Close"].iloc[-1])
+            if _is_num(close):
+                print(f"[info] {ticker}: rebuilt {day} close from {interval} "
+                      f"bars -> {close:.4f}")
+                return close
+        except Exception as e:
+            print(f"[warn] close_from_intraday {ticker} {day} {interval} "
+                  f"failed: {e}", file=sys.stderr)
+    return None
+
+
+def resolve_prev_close(ticker: str, fast_info_prev: float | None = None):
+    """Return (prev_close, prev_close_date, source).
+
+    prev_close_date is ALWAYS the exact previous NYSE session (or None on
+    failure). We never silently fall back to an older session's close --
+    that is the bug this function exists to prevent.
+    """
+    expected = previous_trading_day()
+    if expected is None:
+        print(f"[warn] {ticker}: cannot determine previous trading day",
               file=sys.stderr)
-        return None, None
+        return None, None, "unavailable"
+
+    closes = daily_closes(ticker)
+    if expected in closes:
+        return closes[expected], expected, "daily"
+
+    print(f"[warn] {ticker}: daily bar for {expected} is missing/NaN "
+          f"(have {sorted(closes)[-4:] if closes else []}); "
+          "falling back to intraday reconstruction", file=sys.stderr)
+
+    close = close_from_intraday(ticker, expected)
+    if close is not None:
+        return close, expected, "intraday"
+
+    if _is_num(fast_info_prev):
+        print(f"[warn] {ticker}: using fast_info previous_close "
+              f"{float(fast_info_prev):.4f} for {expected}", file=sys.stderr)
+        return float(fast_info_prev), expected, "fast_info"
+
+    print(f"[warn] {ticker}: no previous close for {expected}; skipping "
+          "(refusing to compare against an older session)", file=sys.stderr)
+    return None, None, "unavailable"
 
 
 def pct_change(cur, prev):
@@ -238,31 +339,39 @@ def evaluate_sustained_and_close(ticker: str, prev_close):
         if hist is None or hist.empty:
             return out
 
-        idx = hist.index
-        if idx.tz is None:
-            hist.index = idx.tz_localize("UTC").tz_convert(ET)
-        else:
-            hist.index = idx.tz_convert(ET)
+        hist = _to_et_index(hist)
 
         today = now_et().date()
         hist = hist[hist.index.date == today]
         if hist.empty:
             return out
 
-        closes = hist["Close"].astype(float); highs = hist["High"].astype(float); lows = hist["Low"].astype(float)
-        pcts = (closes - prev_close) / prev_close * 100.0; high_pcts = (highs - prev_close) / prev_close * 100.0; low_pcts = (lows - prev_close) / prev_close * 100.0; bar_peak_pct = high_pcts.where(high_pcts.abs() >= low_pcts.abs(), low_pcts)
+        closes = hist["Close"].astype(float)
+        highs = hist["High"].astype(float)
+        lows = hist["Low"].astype(float)
+
+        high_pcts = (highs - prev_close) / prev_close * 100.0
+        low_pcts = (lows - prev_close) / prev_close * 100.0
+
+        # For each bar take whichever extreme is further from the reference,
+        # and keep the PRICE that produced it so the reported price and the
+        # reported percentage always describe the same tick.
+        take_high = high_pcts.abs() >= low_pcts.abs()
+        bar_peak_pct = high_pcts.where(take_high, low_pcts)
+        bar_peak_price = highs.where(take_high, lows)
 
         over = bar_peak_pct[bar_peak_pct.abs() >= STOCK_THRESHOLD_PCT]
         out["sustained_minutes"] = int(len(over))
         if not over.empty:
             peak_idx = over.abs().idxmax()
             out["sustained_peak_pct"] = float(over.loc[peak_idx])
-            out["ref_price_sustained"] = float(closes.loc[peak_idx])
+            out["ref_price_sustained"] = float(bar_peak_price.loc[peak_idx])
 
         last_ts = hist.index[-1]
         if last_ts.time() >= dtime(15, 59):
             out["is_session_closed"] = True
-            out["close_pct"] = float(pcts.iloc[-1])
+            out["close_pct"] = float(
+                (closes.iloc[-1] - prev_close) / prev_close * 100.0)
             out["ref_price_close"] = float(closes.iloc[-1])
     except Exception as e:
         print(f"[warn] evaluate_sustained_and_close {ticker} failed: {e}",
@@ -325,17 +434,17 @@ def build_index_message(direction, sp_pct, nq_pct):
     )
 
 
-def _audit_prev_close(ticker, fast_info_prev, daily_prev):
-    """Print a [warn] line if fast_info disagrees with the daily-bar Close
-    by more than PREV_CLOSE_DRIFT_WARN_PCT percent.
+def _audit_prev_close(ticker, fast_info_prev, resolved_prev):
+    """Print a [warn] line if fast_info disagrees with the resolved
+    previous-session close by more than PREV_CLOSE_DRIFT_WARN_PCT percent.
     """
-    if fast_info_prev is None or daily_prev is None or daily_prev == 0:
+    if fast_info_prev is None or resolved_prev is None or resolved_prev == 0:
         return
-    drift = abs(fast_info_prev - daily_prev) / daily_prev * 100.0
+    drift = abs(fast_info_prev - resolved_prev) / resolved_prev * 100.0
     if drift > PREV_CLOSE_DRIFT_WARN_PCT:
         print(f"[warn] {ticker} prev_close drift: "
               f"fast_info={fast_info_prev:.4f} vs "
-              f"daily={daily_prev:.4f} ({drift:.3f}%)",
+              f"resolved={resolved_prev:.4f} ({drift:.3f}%)",
               file=sys.stderr)
 
 
@@ -351,8 +460,9 @@ def main() -> int:
         return 0
 
     regular_hours = is_regular_hours()
+    expected_prev = previous_trading_day()
     print(f"[info] run at {now_et().isoformat()} "
-          f"(regular_hours={regular_hours})")
+          f"(regular_hours={regular_hours}, prev_session={expected_prev})")
 
     day_key = trading_day_key()
     alerted = load_state(day_key)
@@ -364,16 +474,12 @@ def main() -> int:
             continue
         last, fi_prev, day_high, day_low = fetch_quote(ticker)
 
-        # Authoritative prior-trading-day Close from daily bars.
-        prev, prev_date = resolve_prev_close(ticker)
-        _audit_prev_close(ticker, fi_prev, prev)
+        prev, prev_date, prev_source = resolve_prev_close(ticker, fi_prev)
         if prev is None:
-            # Last-resort fallback: only used if daily history is totally unavailable.
-            prev = fi_prev
-        if prev is None:
-            print(f"[warn] {ticker}: no prev_close available, skipping",
-                  file=sys.stderr)
+            # Deliberately no older-session fallback: a wrong reference is
+            # worse than a missed run, and the next run will retry.
             continue
+        _audit_prev_close(ticker, fi_prev, prev)
 
         info = evaluate_sustained_and_close(ticker, prev)
 
@@ -389,7 +495,7 @@ def main() -> int:
 
         if not (sustained_fired or close_fired):
             print(f"[info] {ticker}: no alert "
-                  f"(prev_close={prev:.4f} on {prev_date}, "
+                  f"(prev_close={prev:.4f} on {prev_date} [{prev_source}], "
                   f"sustained_minutes={info['sustained_minutes']}, "
                   f"is_session_closed={info['is_session_closed']}, "
                   f"close_pct={info['close_pct']})")
@@ -407,7 +513,11 @@ def main() -> int:
             if ref_price is None:
                 ref_price = last if last is not None else prev
             intraday_peak = True
-        
+
+        print(f"[info] {ticker}: ALERT {pct:+.2f}% "
+              f"(prev_close={prev:.4f} on {prev_date} [{prev_source}], "
+              f"intraday_peak={intraday_peak})")
+
         new_alerts.append(
             build_stock_message(ticker, ref_price, prev, pct,
                                 intraday_peak=intraday_peak,
@@ -418,21 +528,17 @@ def main() -> int:
     # --- Indices ---
     sp_last, sp_fi_prev, _, _ = fetch_quote(SP500)
     nq_last, nq_fi_prev, _, _ = fetch_quote(NASDAQ_COMP)
-    sp_prev, sp_prev_date = resolve_prev_close(SP500)
-    nq_prev, nq_prev_date = resolve_prev_close(NASDAQ_COMP)
+    sp_prev, sp_prev_date, sp_src = resolve_prev_close(SP500, sp_fi_prev)
+    nq_prev, nq_prev_date, nq_src = resolve_prev_close(NASDAQ_COMP, nq_fi_prev)
     _audit_prev_close(SP500, sp_fi_prev, sp_prev)
     _audit_prev_close(NASDAQ_COMP, nq_fi_prev, nq_prev)
-    if sp_prev is None:      
-        sp_prev = sp_fi_prev
-    if nq_prev is None:        
-        nq_prev = nq_fi_prev
 
     sp_pct = pct_change(sp_last, sp_prev)
     nq_pct = pct_change(nq_last, nq_prev)
     print(f"[info] indices: S&P 500 {fmt_pct(sp_pct)} "
-          f"(prev {sp_prev_date}={sp_prev}), "
+          f"(prev {sp_prev_date}={sp_prev} [{sp_src}]), "
           f"Nasdaq Composite {fmt_pct(nq_pct)} "
-          f"(prev {nq_prev_date}={nq_prev})")
+          f"(prev {nq_prev_date}={nq_prev} [{nq_src}])")
 
     if sp_pct is not None and nq_pct is not None:
         up_key = "index:both-up"
