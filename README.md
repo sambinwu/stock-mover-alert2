@@ -1,54 +1,36 @@
 # stock-mover-alert2
 
-Slack alerts when watched stocks make big intraday moves, or when broad-market indices swing sharply.
+Slack alerts when watched stocks make big moves, or when broad-market indices swing sharply.
 
 ## What triggers an alert
 
-The job runs every 15 minutes during US market hours (Mon-Fri) via GitHub Actions. It posts a single Slack message per (asset, trigger-type) per US trading day.
+**Per-stock** — any ticker in [`watchlist.txt`](watchlist.txt) that is 5%+ away from the previous session's close **and** either
 
-**Per-stock trigger** — any of these tickers moving more than 5% (up or down) vs the previous close:
+- stayed beyond 5% for 90+ cumulative minutes during the regular session, or
+- closed beyond 5%.
 
-`NVDA, META, TSLA, PLTR, MSFT, TEM, TSM, NFLX, GOOGL, AMZN, GS, COST, INTC, ORCL`
+A brief spike past 5% that quickly retraces does not alert.
 
-**Index trigger** — both indices moving the same direction past a threshold:
-- Both **S&P 500 (^GSPC)** and **Nasdaq Composite (^IXIC)** up more than +1.5%, OR
-- Both down more than -1%
+**Index** — S&P 500 (`^GSPC`) and Nasdaq Composite (`^IXIC`) both up more than +1.5%, or both down more than -1%.
 
-## One-time setup (do this yourself)
+Each (ticker, trigger) is posted once per trading day.
 
-1. **Create a Slack Incoming Webhook**
-   - Go to https://api.slack.com/apps and click **Create New App** → *From scratch*.
-   - Name it (e.g. "Stock Mover Alert"), pick your Slack workspace.
-   - In the app settings, click **Incoming Webhooks** → toggle **Activate Incoming Webhooks** on.
-   - Click **Add New Webhook to Workspace**, choose the Slack channel where you want alerts, and click **Allow**.
-   - Copy the resulting URL (looks like `https://hooks.slack.com/services/T0.../B0.../xxxx`).
+## How it runs
 
-2. **Add the webhook as a GitHub Actions secret**
-   - In this repo, go to **Settings → Secrets and variables → Actions → New repository secret**.
-   - Name: `SLACK_WEBHOOK_URL`
-   - Value: paste the webhook URL.
-   - Click **Add secret**.
+- One GitHub Actions run **watches the whole session**: it checks every 3 minutes from the open until 20 minutes after the close (early closes on half-days are handled).
+- GitHub drops most cron slots, so the workflow has many start times; the first one that fires becomes the watcher and the rest exit within seconds (lock step).
+- **Catch-up:** every run first re-checks the previous session with final data, so if a day's after-close check never ran, the alert still arrives the next morning, tagged `⏪补报`.
+- **Self-monitoring:** a Slack warning is posted if the run crashes (once per day) or if market data is missing for many tickers for 5 loops in a row.
+- The repo is public so Actions minutes are free; the Slack webhook lives only in the `SLACK_WEBHOOK_URL` secret.
 
-3. **(Optional) Trigger a test run**
-   - Go to **Actions → stock-mover-alert → Run workflow** and pick `main`.
-   - The job will fetch quotes and only post if any trigger fires; otherwise it exits silently.
+## Changing the watchlist
 
-## How it works
-
-- `alert.py` fetches quotes via `yfinance` (last price + previous close) for each ticker plus `^GSPC`/`^IXIC`, computes intraday %, and posts to Slack.
-- `state/alerted-YYYY-MM-DD.json` tracks which alerts already fired today so you don't get spammed across the 15-minute runs.
-- The state file is persisted between runs via `actions/cache` keyed on the ET date.
-
-## Files
-
-- `alert.py` — alerting logic
-- `requirements.txt` — Python dependencies (`requests`, `yfinance`)
-- `.github/workflows/alert.yml` — the GitHub Actions schedule and runner
+Edit `watchlist.txt` (one ticker per line, Yahoo symbols). Keep it in sync with the 美投 tracked-stock list.
 
 ## Tweaking
 
-Edit the constants at the top of `alert.py`:
+Constants at the top of `alert.py`: `STOCK_THRESHOLD_PCT`, `SUSTAINED_MINUTES_REQUIRED`, `INDEX_UP_THRESHOLD_PCT`, `INDEX_DOWN_THRESHOLD_PCT`, `CHECK_INTERVAL_MIN`.
 
-- `WATCHLIST` — tickers to monitor
-- `STOCK_THRESHOLD_PCT` — per-stock move threshold (default 5.0)
-- `INDEX_UP_THRESHOLD_PCT` / `INDEX_DOWN_THRESHOLD_PCT` — index thresholds
+## Setup (already done)
+
+Slack Incoming Webhook → repo secret `SLACK_WEBHOOK_URL`. Manual test: Actions → stock-mover-alert → Run workflow.

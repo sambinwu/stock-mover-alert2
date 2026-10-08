@@ -1,0 +1,26 @@
+# Tickers watched by alert.py — one per line. Lines starting with # are ignored.
+# Keep this in sync with the 美投 tracked-stock list (跟踪原因 page).
+NVDA
+AMZN
+META
+TEM
+TSLA
+NFLX
+TSM
+GOOGL
+INTC
+CAT
+SNOW
+ANET
+HOOD
+SHOP
+ORCL
+GS
+SPCX
+MSFT
+PLTR
+AAPL
+COST
+AVGO
+MU
+CRWD
