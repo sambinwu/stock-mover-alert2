@@ -1,0 +1,111 @@
+name: mover-watch
+run-name: "异动监控 ${{ inputs.mode || 'live' }}${{ inputs.handoff_from && '（接力）' || '' }}"
+
+# 接力监控：每一轮跑 5 个半小时，结束时自己启动下一轮（最后的 hand-off 步骤）。
+# 定时器只是保险——GitHub 的定时器经常晚几个小时才来（旧版慢的根源），
+# 所以它只负责「发现没有任何一轮在跑的时候重新拉起来」。
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "live=正式监控；dry=只跑一轮、打印不发 Slack"
+        type: choice
+        options: [live, dry]
+        default: live
+      handoff_from:
+        description: "上一轮的编号（接力时自动填，手动启动留空）"
+        required: false
+        default: ""
+      budget_min:
+        description: "这一轮跑多少分钟后交棒（测试时可以填小一点）"
+        required: false
+        default: "330"
+      levels:
+        description: "dry 试跑用：临时改档位，如 0.5,1,2（留空=正式档位）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # 状态存在 state 分支
+  actions: write    # 查有没有别的轮在跑、启动下一轮
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MODE: ${{ inputs.mode || 'live' }}
+      HANDOFF_FROM: ${{ inputs.handoff_from }}
+    steps:
+      - name: Lock（已经有一轮在跑就退出）
+        id: lock
+        run: |
+          # 接力来的、试跑的，不用查。
+          if [ "$MODE" = "dry" ] || [ -n "$HANDOFF_FROM" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          others=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/watch.yml/runs?per_page=40" \
+            --jq "[.workflow_runs[] | select(.status != \"completed\") | select(.id != $GITHUB_RUN_ID) | select((.display_title // \"\") | contains(\"dry\") | not)] | length" || echo 0)
+          others=${others:-0}
+          echo "其他正在跑的轮数: $others"
+          if [ "$others" -gt 0 ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; else echo "skip=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Keep the schedule enabled
+        if: steps.lock.outputs.skip == 'false' && env.MODE == 'live'
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/watch.yml/enable" || true
+
+      - name: Checkout
+        if: steps.lock.outputs.skip == 'false'
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: steps.lock.outputs.skip == 'false'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.lock.outputs.skip == 'false'
+        run: pip install -r requirements.txt
+
+      - name: Watch
+        id: watch
+        if: steps.lock.outputs.skip == 'false'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          OWNERS: ${{ secrets.OWNERS }}
+          GITHUB_TOKEN: ${{ github.token }}
+          BUDGET_MIN: ${{ inputs.budget_min || '330' }}
+          LEVELS: ${{ inputs.levels }}
+        run: |
+          extra=""
+          if [ -n "$LEVELS" ]; then extra="--levels $LEVELS"; fi
+          python watch.py --mode "$MODE" --budget-min "$BUDGET_MIN" $extra
+
+      - name: Hand off（启动下一轮）
+        if: steps.lock.outputs.skip == 'false' && steps.watch.outcome == 'success' && env.MODE == 'live'
+        run: |
+          for attempt in 1 2 3; do
+            if gh workflow run watch.yml --repo "$GITHUB_REPOSITORY" --ref main -f mode=live -f handoff_from="$GITHUB_RUN_ID"; then
+              echo "已启动下一轮"; exit 0
+            fi
+            sleep 20
+          done
+          echo "启动下一轮失败"; exit 1
+
+      - name: Tell Slack if this run broke
+        if: failure() && env.MODE == 'live'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # 一天只报第一次，免得连环失败刷屏。
+          today=$(TZ=America/New_York date +%Y-%m-%d)
+          since=$(date -d "TZ=\"America/New_York\" $today 00:00" -u +%Y-%m-%dT%H:%M:%SZ)
+          prior=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/watch.yml/runs?status=failure&created=%3E%3D$since&per_page=50" \
+            --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID)] | length" || echo 0)
+          if [ "${prior:-0}" -gt 0 ]; then echo "今天已经报过"; exit 0; fi
+          python3 -c 'import json,os; print(json.dumps({"text": "⚠️ 异动提醒这一轮运行失败，提醒可能中断（保险定时器会在 15 分钟左右重新拉起）：" + os.environ["RUN_URL"]}))' > payload.json
+          curl -sS -X POST -H 'Content-Type: application/json' --data @payload.json "$SLACK_WEBHOOK_URL" || true
