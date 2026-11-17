@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""美投异动提醒 v3 —— 跟踪股票一有大动静，几分钟内发到 Slack。
+"""美投异动提醒 v3 —— 跟踪股票有大动静时发到 Slack。
 
 规则（每条都对着「相对上一个收盘价的涨跌幅」）
 ------------------------------------------------
-* 个股：涨跌超过 5%，并且连续 2 次报价都在线外（盘前盘后成交稀，要 3 次）就发。
-  之后扩大到 8% / 12% / 20% / 30% 各追发一条「升级」。
+* 盘中个股（Sam 2026-11-17 定）：涨跌超过 5.5%，并且当天在线外累计待满 30 分钟才发。
+  累计的意思是中途回到线内不清零，回到线外接着算。发的时候必须正在线外。
+  之后到 8% / 12% / 20% / 30%，同样在那条线外累计满 30 分钟，各追发一条「升级」。
+* 收盘（Sam 2026-11-17 定）：16:05 按 5% 再查一遍，收盘涨跌超过 5% 的全部列出来，
+  不管盘中报没报过。这条只列代码和数字，不带新闻、不 @ 人。
+* 盘前、盘后个股：涨跌超过 5%，连续 3 笔不同的成交都在线外就发（成交稀，防单笔乱价）。
 * 报的永远是现价和现在的涨跌幅，不是盘中极值。
 * 时段：盘前 07:00 起、盘中、盘后到 20:00（美东）。
   盘前、盘中对的是昨收；盘后对的是今收；第二天盘前接着对同一个收盘价，
   所以「盘后财报跌 7%」只报一次，第二天早上不会重复。
-* 大盘：标普 500 和纳指同涨超 1.5% 或同跌超 1%（沿用旧版），升级档见下面常量。
-  大盘日里，比纳指多动不到 3 个点的个股合成一行，不单独点名。
-* 收盘后发一条小结：今天提醒过的股票收在哪里；外加「缓涨缓跌」
-  （近 5 个交易日累计超 10%、单日都没超 5%，沿用旧 stock-alert 的规则）。
-* 漏发补报：收盘价是定值，任何时候醒来发现「收盘超线但没报过」都会补一条。
+* 大盘：标普 500 和纳指同涨超 1.5% 或同跌超 1%（沿用旧版），连续 2 次报价确认；
+  升级档见下面常量。大盘日里，比纳指多动不到 3 个点的个股合成一行，不单独点名。
+* 缓涨缓跌（近 5 个交易日累计超 10%、单日都没超 5%，沿用旧 stock-alert 的规则）
+  写在收盘那一条里。
+* 漏发补报：16:05 那条如果当时没发出去，下次醒来（哪怕是第二天早上）会补发。
 
 为什么这么跑
 ------------
@@ -41,18 +45,23 @@ from zoneinfo import ZoneInfo
 import requests
 
 # ------------------------------------------------------------------ settings
-LEVELS = [5.0, 8.0, 12.0, 20.0, 30.0]      # 个股档位（%）
+LEVELS = [5.0, 8.0, 12.0, 20.0, 30.0]      # 个股档位（%）；盘前盘后直接用这组
+LIVE_THRESHOLDS = {5.0: 5.5}               # 盘中第一档的线是 5.5%（其余档不变）
+LIVE_SUSTAIN_MIN = 30                      # 盘中：在线外累计满这么多分钟才发
+LIVE_MAX_GAP_S = 180                       # 两次报价隔得比这久，中间这段不计入累计
+CLOSE_THRESHOLD = 5.0                      # 16:05 收盘那条：涨跌超过这个就列出来
 INDEX_UP_LEVELS = [1.5, 3.0, 5.0]          # 标普、纳指同涨
 INDEX_DOWN_LEVELS = [1.0, 2.0, 3.0, 5.0]   # 标普、纳指同跌
-CONFIRM_REGULAR = 2                        # 盘中：连续几次报价确认
-CONFIRM_EXTENDED = 3                       # 盘前盘后
+CONFIRM_REGULAR = 2                        # 大盘：连续几次报价确认
+CONFIRM_EXTENDED = 3                       # 盘前盘后个股
 EXCESS_PTS = 3.0                           # 比纳指多动不到这么多点 = 跟着大盘
 LOOP_SECONDS = 60
 WINDOW_START = dtime(7, 0)                 # 美东
 WINDOW_END = dtime(20, 5)
 STALE_REGULAR_S = 600                      # 盘中报价超过这么久没更新 = 不算数
 STALE_EXTENDED_S = 900
-SUMMARY_DELAY_MIN = 5                      # 收盘后几分钟发小结
+SUMMARY_DELAY_MIN = 5                      # 收盘后几分钟发收盘那一条（16:05）
+ACCUM_SAVE_EVERY_S = 300                   # 累计时长多久存一次（换轮、重启后能接着算）
 SLOW_WINDOW_DAYS = 5
 SLOW_CUM_PCT = 10.0
 SLOW_DAILY_CAP = 5.0
@@ -261,7 +270,7 @@ def observations(q: dict, now: datetime, cal: Cal) -> list[dict]:
     today = now.date()
     sess_day = datetime.fromtimestamp(rt, ET).date()   # 这个常规时段价格属于哪天
     reg_pct = (px - prev) / prev * 100.0
-    base = {"sess_day": sess_day, "day_low": num(q.get("regularMarketDayLow")),
+    base = {"sess_day": sess_day, "seen": now_ts, "day_low": num(q.get("regularMarketDayLow")),
             "day_high": num(q.get("regularMarketDayHigh"))}
 
     if state == "REGULAR":
@@ -318,37 +327,70 @@ def sent_key(ref_day: date, sym: str, direction: str, level: float) -> str:
 
 
 class Engine:
-    """连续确认 + 档位去重。`sent` 是已经发过的 key（来自 state）。"""
+    """两种确认方式 + 档位去重。`sent` 是已经发过的 key（来自 state）。
 
-    def __init__(self, sent: dict, confirm_override: int | None = None):
+    * 数次数（盘前盘后个股、大盘）：连续 N 笔不同的报价都在线外。
+    * 算时长（盘中个股）：当天在线外累计待满 sustain_s 秒，而且此刻正在线外。
+      累计值 `accum` 会存进 state，换轮、重启后接着算。
+
+    档位的名字（`levels` 里的数）是去重用的；实际那条线可以用 `thresholds` 另给，
+    比如盘中第一档名字是 5、线是 5.5。这样盘前按 5% 报过的，开盘后不会按 5.5% 再报一遍。
+    """
+
+    def __init__(self, sent: dict, confirm_override: int | None = None, accum: dict | None = None):
         self.sent = sent
         self.streak: dict[tuple, int] = {}
         self.last_t: dict[tuple, float] = {}
         self.confirm_override = confirm_override
+        self.accum: dict[str, float] = accum if accum is not None else {}
+        self.last_out: dict[tuple, float] = {}      # 上一次看到它在线外是什么时候
+        self.dirty = False                          # accum 有没有新变化要存
 
-    def observe(self, sym: str, o: dict, levels: list[float]) -> float | None:
+    def observe(self, sym: str, o: dict, levels: list[float], thresholds: dict | None = None,
+                sustain_s: float | None = None) -> float | None:
         """喂一个观察值；返回这次应该发的档位（没有就 None）。"""
         direction = "up" if o["pct"] > 0 else "down"
         other = "down" if direction == "up" else "up"
         need = self.confirm_override or o["need"]
         mag = abs(o["pct"])
+        timed = sustain_s is not None and o["live"]
         fired = None
         for lv in levels:
+            thr = (thresholds or {}).get(lv, lv)
             k = (sym, o["ref_day"], direction, lv)
-            if o["live"] and (o["fresh"] or mag < lv):
-                self.streak[(sym, o["ref_day"], other, lv)] = 0
-            if mag >= lv:
-                if not o["live"]:
-                    self.streak[k] = need
-                elif o["fresh"] and o["t"] != self.last_t.get(k):
-                    self.streak[k] = self.streak.get(k, 0) + 1
-                    self.last_t[k] = o["t"]
-            elif o["fresh"] or not o["live"]:
-                self.streak[k] = 0
-            if (self.streak.get(k, 0) >= need
-                    and sent_key(o["ref_day"], sym, direction, lv) not in self.sent):
+            ks = sent_key(o["ref_day"], sym, direction, lv)
+            if timed:
+                if o["fresh"]:
+                    self.last_out.pop((sym, o["ref_day"], other, lv), None)
+                    if mag >= thr:
+                        last = self.last_out.get(k)
+                        if last is not None and 0 < o["seen"] - last <= LIVE_MAX_GAP_S:
+                            self.accum[ks] = self.accum.get(ks, 0.0) + (o["seen"] - last)
+                            self.dirty = True
+                        self.last_out[k] = o["seen"]
+                    else:
+                        self.last_out.pop(k, None)
+                enough = self.confirm_override is not None or self.accum.get(ks, 0.0) >= sustain_s
+                ok = o["fresh"] and mag >= thr and enough
+            else:
+                if o["live"] and (o["fresh"] or mag < thr):
+                    self.streak[(sym, o["ref_day"], other, lv)] = 0
+                if mag >= thr:
+                    if not o["live"]:
+                        self.streak[k] = need
+                    elif o["fresh"] and o["t"] != self.last_t.get(k):
+                        self.streak[k] = self.streak.get(k, 0) + 1
+                        self.last_t[k] = o["t"]
+                elif o["fresh"] or not o["live"]:
+                    self.streak[k] = 0
+                ok = self.streak.get(k, 0) >= need
+            if ok and ks not in self.sent:
                 fired = lv
         return fired
+
+    def minutes_out(self, sym: str, o: dict, level: float) -> int:
+        direction = "up" if o["pct"] > 0 else "down"
+        return int(self.accum.get(sent_key(o["ref_day"], sym, direction, level), 0.0) // 60)
 
     def prior(self, sym: str, o: dict, levels: list[float]) -> dict | None:
         """同一件事（同参考收盘价、同方向）之前发过的最早那条。"""
@@ -357,6 +399,20 @@ class Engine:
                 if (k := sent_key(o["ref_day"], sym, direction, lv)) in self.sent]
         hits = [h for h in hits if isinstance(h, dict) and h.get("ts")]
         return min(hits, key=lambda h: h["ts"]) if hits else None
+
+
+def judge_stock(engine: Engine, sym: str, o: dict, levels: list[float]) -> float | None:
+    """一只股票的一个观察值该不该发、发哪一档。
+
+    盘中 → 5.5% 线、线外累计满 30 分钟；盘前盘后 → 5% 线、连续 3 笔成交；
+    收盘值不在这里判——它归 16:05 那一条（build_close_report）。
+    """
+    if o["kind"] == "盘中":
+        return engine.observe(sym, o, levels, thresholds=LIVE_THRESHOLDS,
+                              sustain_s=LIVE_SUSTAIN_MIN * 60)
+    if o["kind"] in ("盘前", "盘后"):
+        return engine.observe(sym, o, levels)
+    return None
 
 
 # --------------------------------------------------------------------- state
@@ -445,6 +501,11 @@ def prune_state(data: dict, today: date) -> None:
     days = data.setdefault("days", {})
     for d in [d for d in days if d < cutoff]:
         del days[d]
+    # 累计时长只对「昨收」那一天有用，留 4 天足够跨周末
+    accum = data.setdefault("accum", {})
+    recent = (today - timedelta(days=4)).isoformat()
+    for k in [k for k in accum if k.split("|", 1)[0] < recent]:
+        del accum[k]
 
 
 # --------------------------------------------------------------------- slack
@@ -513,6 +574,8 @@ def stock_block(a: dict, names: dict, owners: dict, now: datetime, with_news: bo
                 f"（{REF_LABEL[kind]} {fmt_px(o['ref'])}）")
     lines = [head]
     meta = []
+    if kind == "盘中" and a.get("minutes") is not None:
+        meta.append(f"在 {a.get('thr', a['level']):g}% 线外累计 {a['minutes']} 分钟")
     if a.get("nq") is not None:
         diff = o["pct"] - a["nq"]
         if abs(diff) >= 0.05:
@@ -555,6 +618,54 @@ def build_message(index_alerts: list, full: list, follow: list, names: dict, own
     if follow:
         items = "、".join(f"{label(a['sym'], names)} {fmt_pct(a['obs']['pct'])}" for a in follow)
         parts.append(f"跟着大盘动的（比纳指多动不到 {EXCESS_PTS:g} 个点）：{items}")
+    return "\n\n".join(parts)
+
+
+def reg_change(q: dict | None) -> tuple[float, float] | None:
+    """(常规时段涨跌幅 %, 价格)；数据不全返回 None。"""
+    if not q:
+        return None
+    px, prev = num(q.get("regularMarketPrice")), num(q.get("regularMarketPreviousClose"))
+    if not (px and prev):
+        return None
+    return (px - prev) / prev * 100.0, px
+
+
+def build_close_report(sess_day: date, today: date, quotes: dict, symbols: list[str], names: dict,
+                       alerted: dict, slow_lines: list[str]) -> str | None:
+    """16:05 那一条：收盘涨跌超过 5% 的全部列出来，只有代码和数字。
+    没有任何可列的就返回 None（不发）。"""
+    movers = []
+    for sym in symbols:
+        rc = reg_change(quotes.get(sym))
+        if rc and abs(rc[0]) >= CLOSE_THRESHOLD:
+            movers.append((rc[0], rc[1], sym))
+    movers.sort(key=lambda m: -abs(m[0]))
+    over = {m[2] for m in movers}
+    back = []       # 盘前、盘中提醒过，但收盘回到 5% 以内的：给个下落
+    for sym in alerted:
+        rc = reg_change(quotes.get(sym))
+        if rc and sym not in over:
+            back.append(f"{label(sym, names)} 收 {fmt_pct(rc[0])}")
+    if not movers and not back and not slow_lines:
+        return None
+    late = "⏪ 补报 " if sess_day != today else ""
+    head = f"*{late}收盘异动 · {sess_day.strftime('%m/%d')}（周{WEEKDAYS[sess_day.weekday()]}）*"
+    sp, nq = reg_change(quotes.get(SP500)), reg_change(quotes.get(NASDAQ))
+    if sp and nq:
+        head += f"　标普500 {fmt_pct(sp[0])}｜纳指 {fmt_pct(nq[0])}"
+    parts = [head]
+    if movers:
+        rows = [f"{'🚀' if pct > 0 else '🔻'} *{label(sym, names)}*　{fmt_pct(pct)}　{fmt_px(px)}"
+                for pct, px, sym in movers]
+        parts.append(f"收盘涨跌超过 {CLOSE_THRESHOLD:g}% 的 {len(movers)} 只：\n" + "\n".join(rows))
+    else:
+        parts.append(f"收盘没有涨跌超过 {CLOSE_THRESHOLD:g}% 的。")
+    if back:
+        parts.append(f"今天提醒过、收盘回到 {CLOSE_THRESHOLD:g}% 以内的：" + "、".join(back))
+    if slow_lines:
+        parts.append(f"🐢 缓涨缓跌（近 {SLOW_WINDOW_DAYS} 个交易日累计超 {SLOW_CUM_PCT:g}%、"
+                     f"单日都没超 {SLOW_DAILY_CAP:g}%）：\n" + "\n".join(slow_lines))
     return "\n\n".join(parts)
 
 
@@ -605,8 +716,10 @@ class Watcher:
         self.state.setdefault("sent", {})
         self.state.setdefault("days", {})
         self.levels = args.levels or LEVELS
-        self.engine = Engine(self.state["sent"], args.confirm)
+        self.engine = Engine(self.state["sent"], args.confirm,
+                             dict(self.state.get("accum") or {}))
         self.bad_loops = 0
+        self.accum_saved_at = time.time()
 
     # ---- state helpers
     def _rebind(self) -> None:
@@ -615,6 +728,19 @@ class Watcher:
         self.state.setdefault("sent", {})
         self.state.setdefault("days", {})
         self.engine.sent = self.state["sent"]
+
+    def save_accum(self, force: bool = False) -> None:
+        """把盘中的线外累计时长存进 state（隔几分钟一次），换轮、重启后能接着算。"""
+        if not self.engine.dirty:
+            return
+        if not force and time.time() - self.accum_saved_at < ACCUM_SAVE_EVERY_S:
+            return
+        self.state["accum"] = {k: round(v) for k, v in self.engine.accum.items() if v >= 60}
+        self.accum_saved_at = time.time()
+        if self.store.commit("accum"):
+            self.engine.dirty = False
+        else:
+            self._rebind()
 
     def _claim_and_send(self, keys: dict, text: str, note: str) -> bool:
         """先登记、登记成功再发；Slack 没收下就撤销登记，下一轮重试。"""
@@ -645,6 +771,8 @@ class Watcher:
         index_alerts, nq_by_kind = [], {}
         for o in idx_obs:
             nq_by_kind[(o["kind"], o["sess_day"])] = o["nq"]
+            if o["kind"] != "盘中":      # 收盘后的大盘数字写在 16:05 那一条里，不单独报
+                continue
             levels = INDEX_UP_LEVELS if o["pct"] > 0 else INDEX_DOWN_LEVELS
             lv = self.engine.observe("INDEX", o, levels)
             if lv:
@@ -661,16 +789,21 @@ class Watcher:
             if any(o["live"] and not o["fresh"] and o["kind"] == "盘中" for o in obs):
                 stale += 1
             for o in obs:
-                lv = self.engine.observe(sym, o, self.levels)
+                lv = judge_stock(self.engine, sym, o, self.levels)
                 if lv:
-                    alerts.append({"sym": sym, "obs": o, "level": lv, "levels": self.levels,
-                                   "quote": q, "prior": self.engine.prior(sym, o, self.levels),
-                                   "nq": nq_by_kind.get((o["kind"], o["sess_day"]))})
+                    a = {"sym": sym, "obs": o, "level": lv, "levels": self.levels,
+                         "quote": q, "prior": self.engine.prior(sym, o, self.levels),
+                         "nq": nq_by_kind.get((o["kind"], o["sess_day"]))}
+                    if o["kind"] == "盘中":
+                        a["thr"] = LIVE_THRESHOLDS.get(lv, lv)
+                        a["minutes"] = self.engine.minutes_out(sym, o, lv)
+                    alerts.append(a)
 
         self._watchdog(now, len(missing) + stale)
         if index_alerts or alerts:
             self._send_alerts(now, index_alerts, alerts)
-        self._maybe_summary(now, quotes)
+        self._maybe_close_report(now, quotes)
+        self.save_accum()
 
     def _index_active(self, o: dict) -> bool:
         direction = "up" if o["pct"] > 0 else "down"
@@ -729,71 +862,47 @@ class Watcher:
                 f"⚠️ *异动提醒：行情数据不正常* — 连续 {self.bad_loops} 轮有 {n_bad} 只股票拿不到最新报价，"
                 "这段时间的提醒可能不全。", "warn data")
 
-    def _maybe_summary(self, now: datetime, quotes: dict) -> None:
+    def _maybe_close_report(self, now: datetime, quotes: dict) -> None:
+        """16:05 那一条。也负责补报：当时没发出去的，下次醒来（哪怕是第二天盘前）补上。"""
         today = now.date()
-        key = f"{today.isoformat()}|SUMMARY"
-        if key in self.state["sent"] or not self.cal.is_session(today):
-            return
         closed = [q for s in self.symbols if (q := quotes.get(s))
-                  and q.get("marketState") != "REGULAR" and q.get("regularMarketTime")
-                  and datetime.fromtimestamp(q["regularMarketTime"], ET).date() == today]
+                  and q.get("marketState") != "REGULAR" and q.get("regularMarketTime")]
         if len(closed) < len(self.symbols) * 0.8:
+            return                                   # 还在盘中
+        days = [datetime.fromtimestamp(q["regularMarketTime"], ET).date() for q in closed]
+        sess_day = max(set(days), key=days.count)    # 刚结束的是哪个交易日
+        if sess_day != today and sess_day != self.cal.prev(today):
+            return
+        key = f"{sess_day.isoformat()}|SUMMARY"
+        if key in self.state["sent"]:
             return
         last_close = max(q["regularMarketTime"] for q in closed)
         if now.timestamp() < last_close + SUMMARY_DELAY_MIN * 60:
             return
-        lines = []
-        alerted = self.state["days"].get(today.isoformat(), {})
-        for sym, rec in sorted(alerted.items(), key=lambda kv: kv[1].get("first_ts", 0)):
-            q = quotes.get(sym)
-            if not q:
-                continue
-            px, prev = num(q.get("regularMarketPrice")), num(q.get("regularMarketPreviousClose"))
-            if not (px and prev):
-                continue
-            pct = (px - prev) / prev * 100
-            lo, hi = num(q.get("regularMarketDayLow")), num(q.get("regularMarketDayHigh"))
-            ext = ""
-            if rec.get("first_pct", 0) < 0 and lo:
-                ext = f"盘中最低 {fmt_pct((lo - prev) / prev * 100)}，"
-            elif rec.get("first_pct", 0) > 0 and hi:
-                ext = f"盘中最高 {fmt_pct((hi - prev) / prev * 100)}，"
-            first_at = datetime.fromtimestamp(rec["first_ts"], ET).strftime("%H:%M")
-            lines.append(f"• {label(sym, self.names)} 收 {fmt_pct(pct)}"
-                         f"（{ext}{first_at} 首次提醒时 {fmt_pct(rec['first_pct'])}）")
         slow_lines, slow_new = [], {}
         slow_sent = self.state.setdefault("slow", {})
-        try:
-            for s in slow_movers(self.symbols, quotes, self.cal, today):
-                d = "up" if s["cum"] > 0 else "down"
-                last = slow_sent.get(f"{s['sym']}|{d}")
-                if last and (today - date.fromisoformat(last)).days < SLOW_REPEAT_DAYS:
-                    continue
-                slow_new[f"{s['sym']}|{d}"] = today.isoformat()
-                slow_lines.append(f"• {label(s['sym'], self.names)} {fmt_pct(s['cum'])}"
-                                  f"（{s['from'].strftime('%m/%d')}→{s['to'].strftime('%m/%d')}）")
-        except Exception as e:
-            log(f"[warn] 缓涨缓跌没算成：{e}")
-        if not lines and not slow_lines:
+        if sess_day == today:
+            try:
+                for s in slow_movers(self.symbols, quotes, self.cal, today):
+                    d = "up" if s["cum"] > 0 else "down"
+                    last = slow_sent.get(f"{s['sym']}|{d}")
+                    if last and (today - date.fromisoformat(last)).days < SLOW_REPEAT_DAYS:
+                        continue
+                    slow_new[f"{s['sym']}|{d}"] = today.isoformat()
+                    slow_lines.append(f"• {label(s['sym'], self.names)} {fmt_pct(s['cum'])}"
+                                      f"（{s['from'].strftime('%m/%d')}→{s['to'].strftime('%m/%d')}）")
+            except Exception as e:
+                log(f"[warn] 缓涨缓跌没算成：{e}")
+        alerted = self.state["days"].get(sess_day.isoformat(), {})
+        text = build_close_report(sess_day, today, quotes, self.symbols, self.names, alerted,
+                                  slow_lines)
+        if text is None:
             self.state["sent"][key] = {"ts": now.timestamp(), "empty": True}
-            self.store.commit("summary (nothing)") or self._rebind()
+            self.store.commit("close report (nothing)") or self._rebind()
             return
-        parts = [f"*收盘小结 · {today.strftime('%m/%d')}（周{WEEKDAYS[today.weekday()]}）*"]
-        sp, nq = quotes.get(SP500), quotes.get(NASDAQ)
-        if sp and nq and num(sp.get("regularMarketPreviousClose")) and num(nq.get("regularMarketPreviousClose")):
-            parts.append("大盘：标普500 {}｜纳指 {}".format(
-                fmt_pct((sp["regularMarketPrice"] - sp["regularMarketPreviousClose"])
-                        / sp["regularMarketPreviousClose"] * 100),
-                fmt_pct((nq["regularMarketPrice"] - nq["regularMarketPreviousClose"])
-                        / nq["regularMarketPreviousClose"] * 100)))
-        if lines:
-            parts.append(f"今天提醒过的 {len(lines)} 只：\n" + "\n".join(lines))
-        if slow_lines:
-            parts.append(f"🐢 缓涨缓跌（近 {SLOW_WINDOW_DAYS} 个交易日累计超 {SLOW_CUM_PCT:g}%、"
-                         f"单日都没超 {SLOW_DAILY_CAP:g}%）：\n" + "\n".join(slow_lines))
         slow_sent.update(slow_new)
-        if self._claim_and_send({key: {"ts": now.timestamp()}}, "\n\n".join(parts), "summary"):
-            log("[sent] 收盘小结")
+        if self._claim_and_send({key: {"ts": now.timestamp()}}, text, "close report"):
+            log("[sent] 收盘异动")
         else:
             for k in slow_new:
                 self.state.get("slow", {}).pop(k, None)
@@ -832,7 +941,8 @@ class Watcher:
         self._claim_and_send(
             {key: {"ts": now.timestamp()}},
             f"⚠️ *异动提醒中断过，刚恢复* — {since}现在 {now.strftime('%H:%M')} ET 重新开始盯盘。"
-            "中间超线的股票会在接下来几分钟补上。", "warn gap")
+            "中断那段时间不计入盘中的线外累计时长，所以盘中提醒可能比平时晚；16:05 收盘那条不受影响。",
+            "warn gap")
 
     # ---- main loop
     def run(self) -> int:
@@ -867,6 +977,10 @@ class Watcher:
                     last_idle_log = time.time()
                 left = budget_s - (time.time() - started)
                 time.sleep(max(1.0, min(wait, 300.0, left)))
+        try:
+            self.save_accum(force=True)      # 交棒前把线外累计时长存一次，下一轮接着算
+        except Exception as e:
+            log(f"[warn] 交棒前存累计时长失败：{e}")
         log("[info] 这一轮时间到，交棒给下一轮")
         return 0
 
