@@ -1,26 +1,30 @@
-# Tickers watched by alert.py — one per line. Lines starting with # are ignored.
-# Keep this in sync with the 美投 tracked-stock list (跟踪原因 page).
-NVDA
-AMZN
-META
-TEM
-TSLA
-NFLX
-TSM
-GOOGL
-INTC
-CAT
-SNOW
-ANET
-HOOD
-SHOP
-ORCL
-GS
-SPCX
-MSFT
-PLTR
-AAPL
-COST
-AVGO
-MU
-CRWD
+# 异动提醒盯的股票：一行一只，「代码 中文名 | 找新闻用的英文关键词」。# 后面是注释。
+# 以美投产品里的跟踪股票清单为准（数据表 stock_track_current_per_ticker）。
+# 上次核对：2026-11-17，27 只。
+NVDA 英伟达 | Nvidia
+TSLA 特斯拉 | Tesla
+MSFT 微软 | Microsoft
+GOOG 谷歌 | Google, Alphabet
+PLTR Palantir | Palantir
+META Meta | Meta
+AMZN 亚马逊 | Amazon
+TSM 台积电 | TSMC, Taiwan Semi
+TEM Tempus AI | Tempus
+SPCX SpaceX | SpaceX
+AAPL 苹果 | Apple
+SNOW Snowflake | Snowflake
+INTC 英特尔 | Intel
+ORCL 甲骨文 | Oracle
+AVGO 博通 | Broadcom
+NFLX 奈飞 | Netflix
+COST Costco | Costco
+MU 美光 | Micron
+HOOD Robinhood | Robinhood
+GS 高盛 | Goldman
+CRWD CrowdStrike | CrowdStrike
+ANET Arista | Arista
+SHOP Shopify | Shopify
+CAT 卡特彼勒 | Caterpillar
+AMD AMD | AMD, Advanced Micro
+LLY 礼来 | Lilly
+MCD 麦当劳 | McDonald

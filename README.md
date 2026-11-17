@@ -1,36 +1,47 @@
-# stock-mover-alert2
+# 美投异动提醒（v3）
 
-Slack alerts when watched stocks make big moves, or when broad-market indices swing sharply.
+美投跟踪的股票一有大动静，几分钟内发到 Slack 的分析师频道。
 
-## What triggers an alert
+2026-11-17 重做。旧版（`alert.py` / `alert.yml`，以及另一个仓库 `stock-alert` 的缓涨缓跌）已停用，文件留着备查。
 
-**Per-stock** — any ticker in [`watchlist.txt`](watchlist.txt) that is 5%+ away from the previous session's close **and** either
+## 什么时候会发
 
-- stayed beyond 5% for 90+ cumulative minutes during the regular session, or
-- closed beyond 5%.
+所有涨跌幅都是「现价相对上一个收盘价」，报的是现在的数字，不是盘中极值。
 
-A brief spike past 5% that quickly retraces does not alert.
+| 情况 | 规则 |
+|---|---|
+| 个股异动 | 涨跌超 5%，连续 2 次报价都在线外就发（盘前盘后成交稀，要 3 次） |
+| 升级 | 之后扩大到 8% / 12% / 20% / 30%，各追发一条 |
+| 时段 | 盘前 07:00 起、盘中、盘后到 20:00（美东）。盘后对的是今天收盘价，第二天盘前接着对同一个价，同一件事不会报两次 |
+| 大盘异动 | 标普 500 和纳指同涨超 1.5%，或同跌超 1%；之后每过一档再报一次 |
+| 大盘日 | 比纳指多动不到 3 个点的个股合成一行「跟着大盘动的」，不单独点名 |
+| 收盘小结 | 收盘 5 分钟后发一条：今天提醒过的股票各收在哪。当天没有提醒就不发 |
+| 缓涨缓跌 | 近 5 个交易日累计超 10%、单日都没超 5%，写在收盘小结里；同一只同方向 7 天内不重复 |
+| 补报 | 收盘超线但当时没报出去的，下次醒来会补一条，标「补报」 |
 
-**Index** — S&P 500 (`^GSPC`) and Nasdaq Composite (`^IXIC`) both up more than +1.5%, or both down more than -1%.
+每条个股提醒带：现价、对的是哪个收盘价、比纳指多动多少、负责分析师、财报时间（如果就在这两天）、24 小时内标题直接提到这家公司的新闻（最多 3 条）。
 
-Each (ticker, trigger) is posted once per trading day.
+## 怎么跑的
 
-## How it runs
+- **接力，不靠定时器。** GitHub 的定时器经常晚几个小时才启动，这是旧版慢的根源。现在每一轮跑 5 个半小时，结束时自己启动下一轮；非监控时段这一轮只是睡着等开盘。
+- **定时器只当保险。** 每 15 分钟来看一眼，有一轮在跑就立刻退出；没有就重新拉起来，并在 Slack 说一声「中断过，刚恢复」。
+- **数据**：Yahoo 报价接口，一次请求拿全部股票，每分钟一次。
+- **去重**：发过什么记在 `state` 分支的 `state.json`。先登记、登记成功才发。
+- **自己会报的故障**：这一轮运行失败（一天只报第一次）、连续 5 轮拿不到行情、中断后恢复。
 
-- One GitHub Actions run **watches the whole session**: it checks every 3 minutes from the open until 20 minutes after the close (early closes on half-days are handled).
-- GitHub drops most cron slots, so the workflow has many start times; the first one that fires becomes the watcher and the rest exit within seconds (lock step).
-- **Catch-up:** every run first re-checks the previous session with final data, so if a day's after-close check never ran, the alert still arrives the next morning, tagged `⏪补报`.
-- **Self-monitoring:** a Slack warning is posted if the run crashes (once per day) or if market data is missing for many tickers for 5 loops in a row.
-- The repo is public so Actions minutes are free; the Slack webhook lives only in the `SLACK_WEBHOOK_URL` secret.
+## 要改东西时
 
-## Changing the watchlist
+| 想改什么 | 改哪里 |
+|---|---|
+| 盯哪些股票 | `watchlist.txt`，一行一只：`代码 中文名 \| 找新闻用的英文关键词`。以美投产品的跟踪清单为准 |
+| 提醒时 @ 谁 | 仓库 Settings → Secrets → `OWNERS`，格式 `NVDA:U08XXXX,META:U08XXXX`（Slack 用户 ID）。没列的股票不 @ 人 |
+| 阈值、确认次数、时段 | `watch.py` 最上面那一组常量 |
+| 发到哪个频道 | Secret `SLACK_WEBHOOK_URL` |
 
-Edit `watchlist.txt` (one ticker per line, Yahoo symbols). Keep it in sync with the 美投 tracked-stock list.
+改完代码想马上生效：Actions 里取消正在跑的那一轮，再手动 Run workflow（mode 选 live）。不手动的话，最晚 5 个半小时后的下一轮自动用上新代码。
 
-## Tweaking
+## 试跑
 
-Constants at the top of `alert.py`: `STOCK_THRESHOLD_PCT`, `SUSTAINED_MINUTES_REQUIRED`, `INDEX_UP_THRESHOLD_PCT`, `INDEX_DOWN_THRESHOLD_PCT`, `CHECK_INTERVAL_MIN`.
-
-## Setup (already done)
-
-Slack Incoming Webhook → repo secret `SLACK_WEBHOOK_URL`. Manual test: Actions → stock-mover-alert → Run workflow.
+- 云端：Actions → mover-watch → Run workflow，mode 选 `dry`。只跑一轮，结果打印在日志里，不发 Slack。想看消息长什么样，`levels` 填 `1,2,3` 这样的低档位。
+- 本地：`python watch.py --mode dry --levels 1,2,3`
+- 规则自测（不联网）：`python tests/test_rules.py`
