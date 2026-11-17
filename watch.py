@@ -30,6 +30,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 import time
 import xml.etree.ElementTree as ElementTree
@@ -449,7 +450,9 @@ def prune_state(data: dict, today: date) -> None:
 # --------------------------------------------------------------------- slack
 def post_slack(webhook: str, text: str) -> bool:
     if webhook == "DRY":
-        print("\n----- [不发 Slack，只打印] -----\n" + text + "\n--------------------------------\n",
+        # 仓库是公开的，日志谁都能看：试跑时不把 Slack 用户 ID 打出来
+        shown = re.sub(r"<@[A-Z0-9]+>", "<@负责人>", text)
+        print("\n----- [不发 Slack，只打印] -----\n" + shown + "\n--------------------------------\n",
               flush=True)
         return True
     for attempt in range(3):
