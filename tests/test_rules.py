@@ -1,6 +1,6 @@
 """规则自测：python tests/test_rules.py（不联网）。"""
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -28,84 +28,124 @@ def ts(day, h, m, s=0):
     return datetime(day.year, day.month, day.day, h, m, s, tzinfo=ET).timestamp()
 
 
+def at(h, m, s=0, day=D):
+    return datetime(day.year, day.month, day.day, h, m, s, tzinfo=ET)
+
+
 def quote(state, px, prev, rt, **kw):
     return {"marketState": state, "regularMarketPrice": px, "regularMarketPreviousClose": prev,
             "regularMarketTime": rt, **kw}
 
 
-def feed(engine, sym, q, now, levels=w.LEVELS):
+def feed(engine, sym, q, now):
+    """和正式流程一样：每个观察值交给 judge_stock。"""
     fired = []
     for o in w.observations(q, now, CAL):
-        lv = engine.observe(sym, o, levels)
+        lv = w.judge_stock(engine, sym, o, w.LEVELS)
         if lv:
             fired.append((o["kind"], lv, o))
     return fired
 
 
-def mark(engine, sym, o, lv, levels=w.LEVELS):
+def mark(engine, sym, o, lv):
     d = "up" if o["pct"] > 0 else "down"
-    for x in levels:
+    for x in w.LEVELS:
         if x <= lv:
             engine.sent.setdefault(w.sent_key(o["ref_day"], sym, d, x), {"ts": o["t"], "pct": o["pct"]})
-
-
-def at(h, m, s=0, day=D):
-    return datetime(day.year, day.month, day.day, h, m, s, tzinfo=ET)
 
 
 def kinds(fired):
     return [(k, lv) for k, lv, _ in fired]
 
 
-def test_regular_needs_two_distinct_quotes():
+def run_minutes(engine, sym, px, start, minutes, prev=100.0):
+    """从 start 起每分钟喂一次盘中报价（价格 px），共 minutes 次；返回第一次触发的 (第几分钟, fired)。"""
+    t = start
+    for i in range(minutes):
+        f = feed(engine, sym, quote("REGULAR", px, prev, t.timestamp() - 3), t)
+        if f:
+            return i, f
+        t += timedelta(minutes=1)
+    return None, []
+
+
+# ------------------------------------------------------------------ 盘中
+def test_intraday_needs_5_5_pct_for_30_minutes():
     e = w.Engine({})
-    assert feed(e, "X", quote("REGULAR", 96.0, 100, ts(D, 10, 0)), at(10, 0, 5)) == []     # -4%
-    assert feed(e, "X", quote("REGULAR", 94.8, 100, ts(D, 10, 1)), at(10, 1, 5)) == []     # 第一次过线
-    assert feed(e, "X", quote("REGULAR", 94.8, 100, ts(D, 10, 1)), at(10, 2, 5)) == []     # 同一笔报价不算
-    f = feed(e, "X", quote("REGULAR", 94.5, 100, ts(D, 10, 3)), at(10, 3, 5))
+    i, f = run_minutes(e, "X", 94.0, at(10, 0), 45)            # -6%，一直在线外
     assert kinds(f) == [("盘中", 5.0)], f
-    assert abs(f[0][2]["pct"] - (-5.5)) < 1e-9      # 报的是现价涨跌幅
+    assert i == 30, i                                          # 第 30 分钟整才发（10:30）
+    assert abs(f[0][2]["pct"] + 6.0) < 1e-9                    # 报的是现价涨跌幅
+    assert e.minutes_out("X", f[0][2], 5.0) == 30
 
 
-def test_spike_that_retraces_does_not_fire():
+def test_intraday_5_3_pct_never_fires():
     e = w.Engine({})
-    feed(e, "X", quote("REGULAR", 94.0, 100, ts(D, 10, 1)), at(10, 1, 5))
-    assert feed(e, "X", quote("REGULAR", 97.0, 100, ts(D, 10, 2)), at(10, 2, 5)) == []
-    assert feed(e, "X", quote("REGULAR", 94.0, 100, ts(D, 10, 3)), at(10, 3, 5)) == []     # 重新数
+    i, f = run_minutes(e, "X", 94.7, at(10, 0), 120)           # -5.3%：过了 5% 但没到 5.5%
+    assert f == []
 
 
-def test_gap_fires_once_at_top_level_then_escalates():
+def test_intraday_time_is_cumulative_and_must_be_out_now():
     e = w.Engine({})
-    feed(e, "X", quote("REGULAR", 69.0, 100, ts(D, 9, 31)), at(9, 31, 5))
-    f = feed(e, "X", quote("REGULAR", 68.5, 100, ts(D, 9, 32)), at(9, 32, 5))
-    assert kinds(f) == [("盘中", 30.0)]
-    mark(e, "X", f[0][2], 30.0)
-    assert feed(e, "X", quote("REGULAR", 68.0, 100, ts(D, 9, 33)), at(9, 33, 5)) == []     # 不重复
-    e2 = w.Engine({})
-    feed(e2, "Y", quote("REGULAR", 94.0, 100, ts(D, 10, 1)), at(10, 1, 5))
-    f = feed(e2, "Y", quote("REGULAR", 94.0, 100, ts(D, 10, 2)), at(10, 2, 5))
-    mark(e2, "Y", f[0][2], 5.0)
-    feed(e2, "Y", quote("REGULAR", 91.5, 100, ts(D, 11, 1)), at(11, 1, 5))
-    f = feed(e2, "Y", quote("REGULAR", 91.0, 100, ts(D, 11, 2)), at(11, 2, 5))
-    assert kinds(f) == [("盘中", 8.0)]
-    assert e2.prior("Y", f[0][2], w.LEVELS)["pct"] == -6.0
+    i, f = run_minutes(e, "X", 94.0, at(10, 0), 21)            # 线外 20 分钟
+    assert f == []
+    i, f = run_minutes(e, "X", 97.0, at(10, 21), 30)           # 回到线内半小时：不发，也不清零
+    assert f == []
+    i, f = run_minutes(e, "X", 94.0, at(10, 51), 30)           # 再出线：接着之前的 20 分钟算
+    assert kinds(f) == [("盘中", 5.0)] and i == 10, (i, f)      # 再过 10 分钟就够 30
 
 
-def test_premarket_needs_three_and_shares_key_with_regular():
+def test_intraday_gap_in_quotes_is_not_counted():
+    e = w.Engine({})
+    run_minutes(e, "X", 94.0, at(10, 0), 11)                   # 线外 10 分钟
+    # 监控断了 40 分钟再回来：中间这段不能算进累计
+    i, f = run_minutes(e, "X", 94.0, at(10, 50), 19)
+    assert f == [], f
+    i, f = run_minutes(e, "X", 94.0, at(11, 9), 5)
+    assert kinds(f) == [("盘中", 5.0)], f
+
+
+def test_intraday_escalation_needs_its_own_30_minutes():
+    e = w.Engine({})
+    i, f = run_minutes(e, "X", 94.0, at(10, 0), 31)
+    mark(e, "X", f[0][2], 5.0)
+    i, f = run_minutes(e, "X", 91.0, at(11, 0), 45)            # 扩大到 -9%
+    assert kinds(f) == [("盘中", 8.0)] and i == 30, (i, f)
+    assert e.prior("X", f[0][2], w.LEVELS)["pct"] == -6.0
+
+
+def test_accum_survives_a_new_run():
+    e = w.Engine({})
+    run_minutes(e, "X", 94.0, at(10, 0), 26)                   # 线外 25 分钟，然后换了一轮
+    saved = {k: round(v) for k, v in e.accum.items() if v >= 60}
+    e2 = w.Engine({}, accum=dict(saved))
+    i, f = run_minutes(e2, "X", 94.0, at(10, 27), 20)
+    assert kinds(f) == [("盘中", 5.0)] and i <= 6, (i, f)       # 接着算，不用再等 30 分钟
+
+
+def test_stale_quote_neither_counts_nor_fires():
+    e = w.Engine({})
+    old = ts(D, 10, 0)
+    for m in range(1, 48):          # 报价时间一直停在 10:00（行情卡住）
+        assert feed(e, "X", quote("REGULAR", 94.0, 100.0, old), at(10, 11 + m)) == []
+
+
+# ------------------------------------------------------------ 盘前、盘后
+def test_premarket_needs_three_and_covers_intraday_base_level():
     e = w.Engine({})
 
     def pre(px, m):   # 昨收 100，盘前价 px
         return quote("PRE", 100.0, 98.0, ts(PREV, 16, 0), preMarketPrice=px, preMarketTime=ts(D, 8, m))
 
-    assert kinds(feed(e, "X", pre(93.0, 1), at(8, 1, 30))) == []
-    assert kinds(feed(e, "X", pre(93.2, 2), at(8, 2, 30))) == []
-    f = [x for x in feed(e, "X", pre(93.1, 3), at(8, 3, 30)) if x[0] == "盘前"]
+    assert feed(e, "X", pre(93.0, 1), at(8, 1, 30)) == []
+    assert feed(e, "X", pre(93.2, 2), at(8, 2, 30)) == []
+    f = feed(e, "X", pre(93.1, 3), at(8, 3, 30))
     assert kinds(f) == [("盘前", 5.0)], f
     assert f[0][2]["ref_day"] == PREV
     mark(e, "X", f[0][2], 5.0)
-    # 开盘后还是 -6.9%：同一个昨收、同一方向、同一档 → 不再报
-    feed(e, "X", quote("REGULAR", 93.1, 100, ts(D, 9, 31)), at(9, 31, 5))
-    assert feed(e, "X", quote("REGULAR", 93.0, 100, ts(D, 9, 32)), at(9, 32, 5)) == []
+    # 开盘后一直 -7%：盘前已经报过这件事，盘中不再按 5.5% 报一遍
+    i, f = run_minutes(e, "X", 93.0, at(9, 31), 90)
+    assert f == [], f
 
 
 def test_post_market_then_next_morning_no_repeat():
@@ -133,22 +173,13 @@ def test_stale_extended_print_does_not_confirm():
         assert feed(e, "X", q, at(7, m)) == []
 
 
-def test_missed_close_is_caught_up_once():
+def test_close_value_is_not_an_individual_alert():
     e = w.Engine({})
-    q = quote("POST", 94.0, 100.0, ts(D, 16, 0))            # 今天收 -6%，盘中没报过
-    f = feed(e, "X", q, at(16, 6))
-    assert kinds(f) == [("收盘", 5.0)]
-    mark(e, "X", f[0][2], 5.0)
-    assert feed(e, "X", q, at(16, 7)) == []
-    # 第二天早上才醒：照样能补，且标成补报
-    e2 = w.Engine({})
-    nxt = date(2026, 11, 18)
-    f = feed(e2, "X", quote("PRE", 94.0, 100.0, ts(D, 16, 0)), at(7, 1, 0, nxt))
-    assert f and f[0][2]["sess_day"] == D
-    a = {"sym": "X", "obs": f[0][2], "level": 5.0, "levels": w.LEVELS, "quote": {}, "prior": None, "nq": None}
-    assert "补报 11/17" in w.stock_block(a, {}, {}, at(7, 1, 0, nxt))
+    q = quote("POST", 94.0, 100.0, ts(D, 16, 0))               # 收 -6%：归 16:05 那一条，不单独报
+    assert feed(e, "X", q, at(16, 6)) == []
 
 
+# ------------------------------------------------------------------ 大盘
 def test_index_both_must_cross():
     e = w.Engine({})
 
@@ -171,13 +202,48 @@ def test_index_both_must_cross():
     assert idx(1.2, 1.4, 6) == [] and idx(1.2, 1.4, 7) == []          # 上涨线是 1.5
 
 
+# ------------------------------------------------------------ 16:05 那一条
+def closed(px, prev=100.0):
+    return quote("POST", px, prev, ts(D, 16, 0))
+
+
+def test_close_report_lists_everything_beyond_5_pct():
+    quotes = {"AAA": closed(94.9), "BBB": closed(105.2), "CCC": closed(95.1), "DDD": closed(97.0),
+              w.SP500: closed(98.9), w.NASDAQ: closed(98.7)}
+    names = {"AAA": "甲", "BBB": "乙", "CCC": "丙", "DDD": "丁"}
+    alerted = {"DDD": {"first_pct": -6.1, "first_ts": ts(D, 11, 0), "kind": "盘中"},
+               "AAA": {"first_pct": -5.8, "first_ts": ts(D, 12, 0), "kind": "盘中"}}
+    text = w.build_close_report(D, D, quotes, list(names), names, alerted, [])
+    assert "收盘异动 · 11/17（周二）" in text and "标普500 -1.1%｜纳指 -1.3%" in text, text
+    assert "收盘涨跌超过 5% 的 2 只" in text, text
+    assert "乙 BBB*　+5.2%　$105.20" in text and "甲 AAA*　-5.1%　$94.90" in text, text
+    assert text.index("BBB") < text.index("AAA")                      # 幅度大的在前
+    assert "CCC" not in text                                          # -4.9%：没过线、也没提醒过
+    assert "今天提醒过、收盘回到 5% 以内的：丁 DDD 收 -3.0%" in text, text
+    assert "http" not in text and "<@" not in text                    # 不带新闻、不 @ 人
+
+
+def test_close_report_stays_silent_when_nothing_to_show():
+    quotes = {"AAA": closed(99.0), w.SP500: closed(100.2), w.NASDAQ: closed(100.1)}
+    assert w.build_close_report(D, D, quotes, ["AAA"], {"AAA": "甲"}, {}, []) is None
+
+
+def test_close_report_marks_catch_up():
+    quotes = {"AAA": closed(93.0)}
+    text = w.build_close_report(D, date(2026, 11, 18), quotes, ["AAA"], {"AAA": "甲"}, {}, [])
+    assert "补报 收盘异动 · 11/17" in text, text
+
+
+# ------------------------------------------------------------------ 文字
 def test_message_renders():
     q = quote("REGULAR", 94.0, 100.0, ts(D, 10, 2), earningsTimestamp=ts(D, 16, 5))
     o = w.observations(q, at(10, 2, 5), CAL)[0]
     a = {"sym": "NVDA", "obs": o, "level": 5.0, "levels": w.LEVELS, "quote": q, "prior": None,
-         "nq": -1.0, "news": [{"title": "A <b> & c", "src": "Reuters", "ts": ts(D, 9, 40), "url": "https://x.y/z"}]}
+         "nq": -1.0, "thr": 5.5, "minutes": 31,
+         "news": [{"title": "A <b> & c", "src": "Reuters", "ts": ts(D, 9, 40), "url": "https://x.y/z"}]}
     text = w.build_message([], [a], [], {"NVDA": "英伟达"}, {"NVDA": "U123"}, at(10, 2, 5))
     assert "英伟达 NVDA　盘中 -6.0%" in text and "$94.00" in text and "昨收 $100.00" in text, text
+    assert "在 5.5% 线外累计 31 分钟" in text, text
     assert "比纳指多跌 5.0 个点（纳指 -1.0%）" in text and "<@U123>" in text, text
     assert "财报时间：11/17 16:05 ET" in text and "A &lt;b&gt; &amp; c" in text, text
 
