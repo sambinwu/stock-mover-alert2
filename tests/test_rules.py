@@ -228,6 +228,19 @@ def test_close_report_stays_silent_when_nothing_to_show():
     assert w.build_close_report(D, D, quotes, ["AAA"], {"AAA": "甲"}, {}, []) is None
 
 
+def test_close_report_stays_silent_when_only_an_earlier_alert_came_back():
+    # 2026-11-17 实际发生的：HOOD 盘中提醒过、收 -4.0%，其余都在 5% 以内 → 不发
+    quotes = {"HOOD": closed(96.0), "AAA": closed(98.0), w.SP500: closed(99.0), w.NASDAQ: closed(99.3)}
+    alerted = {"HOOD": {"first_pct": -5.44, "first_ts": ts(D, 13, 49), "kind": "盘中"}}
+    assert w.build_close_report(D, D, quotes, ["HOOD", "AAA"], {}, alerted, []) is None
+
+
+def test_close_report_still_goes_out_for_slow_movers_alone():
+    quotes = {"AAA": closed(98.0)}
+    text = w.build_close_report(D, D, quotes, ["AAA"], {"AAA": "甲"}, {}, ["• 甲 AAA +11.2%（11/11→11/17）"])
+    assert text and "缓涨缓跌" in text and "收盘涨跌超过" not in text, text
+
+
 def test_close_report_marks_catch_up():
     quotes = {"AAA": closed(93.0)}
     text = w.build_close_report(D, date(2026, 11, 18), quotes, ["AAA"], {"AAA": "甲"}, {}, [])
