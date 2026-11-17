@@ -24,6 +24,8 @@ on:
         description: "dry 试跑用：临时改档位，如 0.5,1,2（留空=正式档位）"
         required: false
         default: ""
+  schedule:
+    - cron: '7,22,37,52 * * * *'
 
 permissions:
   contents: write   # 状态存在 state 分支
