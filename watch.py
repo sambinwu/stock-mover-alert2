@@ -8,6 +8,7 @@
   之后到 8% / 12% / 20% / 30%，同样在那条线外累计满 30 分钟，各追发一条「升级」。
 * 收盘（Sam 2026-11-17 定）：16:05 按 5% 再查一遍，收盘涨跌超过 5% 的全部列出来，
   不管盘中报没报过。这条只列代码和数字，不带新闻、不 @ 人。
+  收盘没有超过 5% 的，这条就不发（Sam 同日看到第一条空的收盘消息后定）。
 * 盘前、盘后个股：涨跌超过 5%，连续 3 笔不同的成交都在线外就发（成交稀，防单笔乱价）。
 * 报的永远是现价和现在的涨跌幅，不是盘中极值。
 * 时段：盘前 07:00 起、盘中、盘后到 20:00（美东）。
@@ -634,7 +635,7 @@ def reg_change(q: dict | None) -> tuple[float, float] | None:
 def build_close_report(sess_day: date, today: date, quotes: dict, symbols: list[str], names: dict,
                        alerted: dict, slow_lines: list[str]) -> str | None:
     """16:05 那一条：收盘涨跌超过 5% 的全部列出来，只有代码和数字。
-    没有任何可列的就返回 None（不发）。"""
+    收盘没有超过 5% 的（也没有缓涨缓跌）就返回 None，不发。"""
     movers = []
     for sym in symbols:
         rc = reg_change(quotes.get(sym))
@@ -647,7 +648,9 @@ def build_close_report(sess_day: date, today: date, quotes: dict, symbols: list[
         rc = reg_change(quotes.get(sym))
         if rc and sym not in over:
             back.append(f"{label(sym, names)} 收 {fmt_pct(rc[0])}")
-    if not movers and not back and not slow_lines:
+    # Sam 2026-11-17：收盘没有新的异动就不发。「提醒过、收盘回到线内」那一行只是顺带交代，
+    # 单凭它不值得发一条。
+    if not movers and not slow_lines:
         return None
     late = "⏪ 补报 " if sess_day != today else ""
     head = f"*{late}收盘异动 · {sess_day.strftime('%m/%d')}（周{WEEKDAYS[sess_day.weekday()]}）*"
@@ -659,8 +662,6 @@ def build_close_report(sess_day: date, today: date, quotes: dict, symbols: list[
         rows = [f"{'🚀' if pct > 0 else '🔻'} *{label(sym, names)}*　{fmt_pct(pct)}　{fmt_px(px)}"
                 for pct, px, sym in movers]
         parts.append(f"收盘涨跌超过 {CLOSE_THRESHOLD:g}% 的 {len(movers)} 只：\n" + "\n".join(rows))
-    else:
-        parts.append(f"收盘没有涨跌超过 {CLOSE_THRESHOLD:g}% 的。")
     if back:
         parts.append(f"今天提醒过、收盘回到 {CLOSE_THRESHOLD:g}% 以内的：" + "、".join(back))
     if slow_lines:
