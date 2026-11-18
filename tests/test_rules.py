@@ -105,13 +105,29 @@ def test_intraday_gap_in_quotes_is_not_counted():
     assert kinds(f) == [("盘中", 5.0)], f
 
 
-def test_intraday_escalation_needs_its_own_30_minutes():
+def test_intraday_once_per_day_no_escalation():
+    # Sam 2026-11-18：CRWD 11:24 报了 +6.2%，13:48 又因为过 8% 追了一条——不要第二条
     e = w.Engine({})
-    i, f = run_minutes(e, "X", 94.0, at(10, 0), 31)
+    i, f = run_minutes(e, "X", 106.0, at(10, 0), 31)
     mark(e, "X", f[0][2], 5.0)
-    i, f = run_minutes(e, "X", 91.0, at(11, 0), 45)            # 扩大到 -9%
-    assert kinds(f) == [("盘中", 8.0)] and i == 30, (i, f)
-    assert e.prior("X", f[0][2], w.LEVELS)["pct"] == -6.0
+    i, f = run_minutes(e, "X", 109.0, at(11, 0), 120)          # 扩大到 +9%，待满两小时
+    assert f == [], f
+    i, f = run_minutes(e, "X", 93.0, at(13, 0), 120)           # 反转成 -7%：今天也不再报
+    assert f == [], f
+
+
+def test_after_hours_is_a_new_event_after_an_intraday_alert():
+    e = w.Engine({})
+    i, f = run_minutes(e, "X", 94.0, at(10, 0), 31)            # 盘中报过 -6%（对昨收 100）
+    mark(e, "X", f[0][2], 5.0)
+
+    def post(px, m):   # 今天收 94，盘后再跌到 88（对今天收盘 -6.4%，比如收盘后出财报）
+        return quote("POST", 94.0, 100.0, ts(D, 16, 0), postMarketPrice=px, postMarketTime=ts(D, 17, m))
+
+    feed(e, "X", post(88.0, 1), at(17, 1, 30))
+    feed(e, "X", post(88.1, 2), at(17, 2, 30))
+    f = feed(e, "X", post(87.9, 3), at(17, 3, 30))
+    assert kinds(f) == [("盘后", 5.0)] and f[0][2]["ref_day"] == D, f
 
 
 def test_accum_survives_a_new_run():
