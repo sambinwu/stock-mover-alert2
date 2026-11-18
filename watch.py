@@ -401,13 +401,24 @@ class Engine:
         hits = [h for h in hits if isinstance(h, dict) and h.get("ts")]
         return min(hits, key=lambda h: h["ts"]) if hits else None
 
+    def alerted(self, sym: str, ref_day: date) -> bool:
+        """这只股票对这个参考收盘价报过没有（不论方向、档位）。"""
+        prefix = f"{ref_day.isoformat()}|{sym}|"
+        return any(k.startswith(prefix) for k in self.sent)
+
 
 def judge_stock(engine: Engine, sym: str, o: dict, levels: list[float]) -> float | None:
     """一只股票的一个观察值该不该发、发哪一档。
 
     盘中 → 5.5% 线、线外累计满 30 分钟；盘前盘后 → 5% 线、连续 3 笔成交；
     收盘值不在这里判——它归 16:05 那一条（build_close_report）。
+
+    一只股票对同一个参考收盘价只报一次（Sam 2026-11-18：「只要提醒过，今天就不用再提醒了」）。
+    报过之后不再追 8% / 12% 这些档，反方向也不再报。盘前和盘中对的是同一个昨收，算一次；
+    盘后对的是今天收盘价，是新的一件事，可以再报一次，第二天盘前、盘中接着算这一次。
     """
+    if engine.alerted(sym, o["ref_day"]):
+        return None
     if o["kind"] == "盘中":
         return engine.observe(sym, o, levels, thresholds=LIVE_THRESHOLDS,
                               sustain_s=LIVE_SUSTAIN_MIN * 60)
