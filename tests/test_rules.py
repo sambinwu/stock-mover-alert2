@@ -116,18 +116,17 @@ def test_intraday_once_per_day_no_escalation():
     assert f == [], f
 
 
-def test_after_hours_is_a_new_event_after_an_intraday_alert():
+def test_no_alert_after_hours_even_after_a_new_drop():
+    # Sam 2026-11-19：只做盘中。盘中报过，盘后再跌 6%（比如收盘后出财报）也不单独报
     e = w.Engine({})
-    i, f = run_minutes(e, "X", 94.0, at(10, 0), 31)            # 盘中报过 -6%（对昨收 100）
+    i, f = run_minutes(e, "X", 94.0, at(10, 0), 31)
     mark(e, "X", f[0][2], 5.0)
 
-    def post(px, m):   # 今天收 94，盘后再跌到 88（对今天收盘 -6.4%，比如收盘后出财报）
+    def post(px, m):
         return quote("POST", 94.0, 100.0, ts(D, 16, 0), postMarketPrice=px, postMarketTime=ts(D, 17, m))
 
-    feed(e, "X", post(88.0, 1), at(17, 1, 30))
-    feed(e, "X", post(88.1, 2), at(17, 2, 30))
-    f = feed(e, "X", post(87.9, 3), at(17, 3, 30))
-    assert kinds(f) == [("盘后", 5.0)] and f[0][2]["ref_day"] == D, f
+    for m in range(1, 8):
+        assert feed(e, "X", post(88.0 + m / 100, m), at(17, m, 30)) == []
 
 
 def test_accum_survives_a_new_run():
@@ -147,39 +146,28 @@ def test_stale_quote_neither_counts_nor_fires():
 
 
 # ------------------------------------------------------------ 盘前、盘后
-def test_premarket_needs_three_and_covers_intraday_base_level():
+def test_premarket_never_alerts_and_intraday_still_does():
+    # Sam 2026-11-19：「盘前也不用提醒，我们只做盘中的提醒」
     e = w.Engine({})
 
-    def pre(px, m):   # 昨收 100，盘前价 px
+    def pre(px, m):   # 昨收 100，盘前一直 -7%
         return quote("PRE", 100.0, 98.0, ts(PREV, 16, 0), preMarketPrice=px, preMarketTime=ts(D, 8, m))
 
-    assert feed(e, "X", pre(93.0, 1), at(8, 1, 30)) == []
-    assert feed(e, "X", pre(93.2, 2), at(8, 2, 30)) == []
-    f = feed(e, "X", pre(93.1, 3), at(8, 3, 30))
-    assert kinds(f) == [("盘前", 5.0)], f
-    assert f[0][2]["ref_day"] == PREV
-    mark(e, "X", f[0][2], 5.0)
-    # 开盘后一直 -7%：盘前已经报过这件事，盘中不再按 5.5% 报一遍
-    i, f = run_minutes(e, "X", 93.0, at(9, 31), 90)
-    assert f == [], f
+    for m in range(1, 30):
+        assert feed(e, "X", pre(93.0 + m / 100, m), at(8, m, 30)) == []
+    # 开盘后还在 -7%：盘中照常按 5.5%、30 分钟报
+    i, f = run_minutes(e, "X", 93.0, at(9, 31), 45)
+    assert kinds(f) == [("盘中", 5.0)] and i == 30, (i, f)
 
 
-def test_post_market_then_next_morning_no_repeat():
+def test_post_market_never_alerts():
     e = w.Engine({})
 
     def post(px, m):
         return quote("POST", 100.0, 99.0, ts(D, 16, 0), postMarketPrice=px, postMarketTime=ts(D, 17, m))
 
-    feed(e, "X", post(92.0, 1), at(17, 1, 30))
-    feed(e, "X", post(92.5, 2), at(17, 2, 30))
-    f = feed(e, "X", post(92.2, 3), at(17, 3, 30))
-    assert kinds(f) == [("盘后", 5.0)], f
-    assert f[0][2]["ref_day"] == D and f[0][2]["ref"] == 100.0
-    mark(e, "X", f[0][2], 5.0)
-    nxt = date(2026, 11, 18)
-    for m in (1, 2, 3, 4):
-        q = quote("PRE", 100.0, 99.0, ts(D, 16, 0), preMarketPrice=92.3, preMarketTime=ts(nxt, 8, m))
-        assert feed(e, "X", q, at(8, m, 30, nxt)) == []
+    for m in range(1, 10):
+        assert feed(e, "X", post(92.0 + m / 100, m), at(17, m, 30)) == []
 
 
 def test_stale_extended_print_does_not_confirm():
