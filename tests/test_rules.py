@@ -265,6 +265,77 @@ def test_message_renders():
         assert gone not in text, (gone, text)
 
 
+# ------------------------------------------------------- 发送节奏（整轮模拟）
+def run_watcher(prices_at, start, minutes):
+    """用假的行情、时钟、Slack 跑 Watcher.tick；返回 [(时间, 消息文字)]。
+
+    prices_at(t) -> {代码: 现价}，昨收都是 100；大盘平盘。
+    """
+    import types
+    sent, clock = [], {"t": start}
+    names = {"AAA": "甲", "BBB": "乙", "CCC": "丙", "DDD": "丁"}
+    saved = {k: getattr(w, k) for k in ("Cal", "load_watchlist", "load_owners", "fetch_quotes",
+                                        "now_et", "post_slack", "log")}
+
+    def quotes(_syms):
+        t = clock["t"].timestamp() - 3
+        q = {s: quote("REGULAR", px, 100.0, t) for s, px in prices_at(clock["t"]).items()}
+        q[w.SP500] = quote("REGULAR", 100.0, 100.0, t)
+        q[w.NASDAQ] = quote("REGULAR", 100.0, 100.0, t)
+        return q
+
+    try:
+        w.Cal = FakeCal
+        w.load_watchlist = lambda: (dict(names), {})
+        w.load_owners = lambda: {}
+        w.fetch_quotes = quotes
+        w.now_et = lambda: clock["t"]
+        w.post_slack = lambda _hook, text: sent.append((clock["t"], text)) or True
+        w.log = lambda *_a, **_k: None
+        wt = w.Watcher(types.SimpleNamespace(levels=None, confirm=None), w.LocalStore(None), "")
+        for _ in range(minutes):
+            wt.tick()
+            clock["t"] += timedelta(minutes=1)
+    finally:
+        for k, v in saved.items():
+            setattr(w, k, v)
+    return sent
+
+
+def test_at_most_one_message_per_30_minutes_and_bundle_the_rest():
+    # Sam 2026-11-20：「平均每半个小时才可以发一次，如果正好有2-3个股票，那就做成一条信息」
+    def prices(t):
+        p = {"AAA": 100.0, "BBB": 100.0, "CCC": 100.0, "DDD": 100.0}
+        if t >= at(10, 0):
+            p["AAA"] = 94.0          # 10:30 够格 → 第一条马上发
+        if t >= at(10, 10):
+            p["BBB"] = 93.0          # 10:40 够格 → 攒着
+        if t >= at(10, 20):
+            p["CCC"] = 107.0         # 10:50 够格 → 攒着
+        return p
+
+    sent = run_watcher(prices, at(9, 45), 120)
+    times = [t.strftime("%H:%M") for t, _ in sent]
+    assert times == ["10:30", "11:00"], times
+    assert "AAA" in sent[0][1] and "BBB" not in sent[0][1], sent[0][1]
+    assert "BBB" in sent[1][1] and "CCC" in sent[1][1] and "AAA" not in sent[1][1], sent[1][1]
+
+
+def test_held_stock_that_slips_back_waits_for_its_next_time_beyond():
+    def prices(t):
+        p = {"AAA": 100.0, "BBB": 100.0, "CCC": 100.0, "DDD": 100.0}
+        if t >= at(10, 0):
+            p["AAA"] = 94.0                      # 10:30 发
+        if at(10, 10) <= t < at(10, 58) or t >= at(11, 10):
+            p["BBB"] = 93.0                      # 10:40 够格；10:58–11:10 回到线内
+        return p
+
+    sent = run_watcher(prices, at(9, 45), 120)
+    times = [t.strftime("%H:%M") for t, _ in sent]
+    assert times == ["10:30", "11:10"], times    # 11:00 到点时乙不在线外，不发；回到线外再发
+    assert "BBB" in sent[1][1]
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(globals().items()):
