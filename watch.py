@@ -3,6 +3,8 @@
 
 规则（每条都对着「相对上一个收盘价的涨跌幅」）
 ------------------------------------------------
+* 盘中两条提醒之间至少隔 30 分钟（Sam 2026-11-20 定）。这中间够格的个股和大盘先攒着，
+  到点那一分钟还在线外的合成一条发；16:05 收盘那一条不受限制。
 * 盘中个股（Sam 2026-11-17 定）：涨跌超过 5.5%，并且当天在线外累计待满 30 分钟才发。
   累计的意思是中途回到线内不清零，回到线外接着算。发的时候必须正在线外。
   一只股票一天只报一次，不追发「升级」（Sam 2026-11-18 定）。
@@ -60,6 +62,7 @@ WINDOW_END = dtime(20, 5)
 STALE_REGULAR_S = 600                      # 盘中报价超过这么久没更新 = 不算数
 STALE_EXTENDED_S = 900
 SUMMARY_DELAY_MIN = 5                      # 收盘后几分钟发收盘那一条（16:05）
+ALERT_GAP_MIN = 30                         # 盘中两条提醒之间至少隔多久；中间攒下的合成一条
 ACCUM_SAVE_EVERY_S = 300                   # 累计时长多久存一次（换轮、重启后能接着算）
 SLOW_WINDOW_DAYS = 5
 SLOW_CUM_PCT = 10.0
@@ -698,6 +701,7 @@ class Watcher:
                              dict(self.state.get("accum") or {}))
         self.bad_loops = 0
         self.accum_saved_at = time.time()
+        self.held_note = ""
 
     # ---- state helpers
     def _rebind(self) -> None:
@@ -779,9 +783,29 @@ class Watcher:
 
         self._watchdog(now, len(missing) + stale)
         if index_alerts or alerts:
-            self._send_alerts(now, index_alerts, alerts)
+            wait = self._gap_left_s(now)
+            if wait > 0:
+                note = " ".join(sorted({a["sym"] for a in index_alerts + alerts}))
+                if note != self.held_note:
+                    log(f"[hold] 离上一条不到 {ALERT_GAP_MIN} 分钟，先攒着（还差 {wait // 60:.0f} 分钟）：{note}")
+                    self.held_note = note
+            else:
+                self._send_alerts(now, index_alerts, alerts)
+                self.held_note = ""
         self._maybe_close_report(now, quotes)
         self.save_accum()
+
+    def _gap_left_s(self, now: datetime) -> float:
+        """离能发下一条盘中提醒还差几秒（0 = 现在就能发）。
+
+        Sam 2026-11-20：「平均每半个小时才可以发一次，如果正好有2-3个股票，那就做成一条信息」。
+        上一条的时间从 state 里已登记的盘中提醒（个股和大盘）取，换轮、重启后照样算。
+        攒着的不登记；到点那一分钟还在线外的，一起发一条。16:05 收盘那一条不受这个限制。
+        """
+        last = max((v["ts"] for v in self.state["sent"].values()
+                    if isinstance(v, dict) and v.get("kind") == "盘中" and v.get("ts")),
+                   default=0.0)
+        return max(0.0, last + ALERT_GAP_MIN * 60 - now.timestamp())
 
     def _index_active(self, o: dict) -> bool:
         direction = "up" if o["pct"] > 0 else "down"
