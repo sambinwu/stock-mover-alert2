@@ -259,10 +259,10 @@ def test_message_renders():
          "nq": -1.0, "thr": 5.5, "minutes": 31,
          "news": [{"title": "A <b> & c", "src": "Reuters", "ts": ts(D, 9, 40), "url": "https://x.y/z"}]}
     text = w.build_message([], [a], [], {"NVDA": "英伟达"}, {"NVDA": "U123"}, at(10, 2, 5))
-    assert "英伟达 NVDA　盘中 -6.0%" in text and "$94.00" in text and "昨收 $100.00" in text, text
-    assert "在 5.5% 线外累计 31 分钟" in text, text
-    assert "比纳指多跌 5.0 个点（纳指 -1.0%）" in text and "<@U123>" in text, text
-    assert "财报时间：11/17 16:05 ET" in text and "A &lt;b&gt; &amp; c" in text, text
+    # Sam 2026-11-20：只要涨跌幅和 @，不要新闻、现价、累计时长、比纳指、财报时间
+    assert text.endswith("🔻 *英伟达 NVDA　盘中 -6.0%*　<@U123>"), text
+    for gone in ("$94.00", "线外累计", "纳指", "财报", "Reuters", "x.y/z"):
+        assert gone not in text, (gone, text)
 
 
 if __name__ == "__main__":
