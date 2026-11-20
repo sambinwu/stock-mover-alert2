@@ -563,48 +563,18 @@ def earnings_tag(q: dict, now: datetime) -> str:
 REF_LABEL = {"盘前": "昨收", "盘中": "昨收", "盘后": "今收", "收盘": "前收"}
 
 
-def stock_block(a: dict, names: dict, owners: dict, now: datetime, with_news: bool = True) -> str:
+def stock_block(a: dict, names: dict, owners: dict, now: datetime) -> str:
+    """一行：哪只、涨跌多少、@ 负责人。
+
+    Sam 2026-11-20：「异动不需要把新闻贴出来…仅仅提醒就好了」「仅仅说下跌幅度即可」。
+    所以不带新闻、现价、线外累计多久、比纳指多动多少、财报时间。
+    """
     o, sym = a["obs"], a["sym"]
-    up = o["pct"] > 0
-    icon = "🚀" if up else "🔻"
-    word = "涨" if up else "跌"
-    title = label(sym, names)
-    kind = o["kind"]
-    late = ""
-    if kind == "收盘" and o["sess_day"] != now.date():
-        late = f"⏪ 补报 {o['sess_day'].strftime('%m/%d')}："
-    if a["prior"]:
-        first_at = datetime.fromtimestamp(a["prior"]["ts"], ET).strftime("%H:%M")
-        head = (f"{icon} {late}*{title} {word}幅扩大到 {fmt_pct(o['pct'])}*　{kind} {fmt_px(o['px'])}"
-                f"（{first_at} 首次提醒时 {fmt_pct(a['prior']['pct'])}）")
-    else:
-        head = (f"{icon} {late}*{title}　{kind} {fmt_pct(o['pct'])}*　{fmt_px(o['px'])}"
-                f"（{REF_LABEL[kind]} {fmt_px(o['ref'])}）")
-    lines = [head]
-    meta = []
-    if kind == "盘中" and a.get("minutes") is not None:
-        meta.append(f"在 {a.get('thr', a['level']):g}% 线外累计 {a['minutes']} 分钟")
-    if a.get("nq") is not None:
-        diff = o["pct"] - a["nq"]
-        if abs(diff) >= 0.05:
-            rel = (f"比纳指多{word} {abs(diff):.1f} 个点" if (diff > 0) == up
-                   else f"比纳指少{word} {abs(diff):.1f} 个点")
-            meta.append(f"{rel}（纳指 {fmt_pct(a['nq'])}）")
+    icon = "🚀" if o["pct"] > 0 else "🔻"
+    line = f"{icon} *{label(sym, names)}　{o['kind']} {fmt_pct(o['pct'])}*"
     if owners.get(sym):
-        meta.append(f"<@{owners[sym]}>")
-    if meta:
-        lines.append("　" + "｜".join(meta))
-    tag = earnings_tag(a["quote"], now)
-    if tag:
-        lines.append("　" + tag)
-    if with_news and a.get("news") == []:
-        lines.append("　（24 小时内没找到标题直接提到它的新闻）")
-    if with_news:
-        for n in a.get("news") or []:
-            src = f" — {esc(n['src'])}" if n["src"] else ""
-            link = f"<{n['url']}|{esc(n['title'])}>" if n["url"] else esc(n["title"])
-            lines.append(f"　• {link}{src} · {ago(n['ts'])}")
-    return "\n".join(lines)
+        line += f"　<@{owners[sym]}>"
+    return line
 
 
 def index_block(a: dict, now: datetime) -> str:
@@ -843,9 +813,6 @@ class Watcher:
                 follow.append(a)
             else:
                 full.append(a)
-        for a in full:
-            a["news"] = fetch_news(a["sym"], self.keywords.get(a["sym"], []),
-                                   NEWS_COUNT if len(full) <= 4 else 2)
         text = build_message(index_alerts, full, follow, self.names, self.owners, now)
         note = " ".join(sorted({a["sym"] for a in index_alerts + alerts}))
         if self._claim_and_send(keys, text, note):
