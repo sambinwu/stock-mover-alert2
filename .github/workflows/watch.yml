@@ -1,9 +1,10 @@
 name: mover-watch
 run-name: "异动监控 ${{ inputs.mode || 'live' }}${{ inputs.handoff_from && '（接力）' || '' }}"
 
-# 接力监控：每一轮跑 5 个半小时，结束时自己启动下一轮（最后的 hand-off 步骤）。
-# 定时器只是保险——GitHub 的定时器经常晚几个小时才来（旧版慢的根源），
-# 所以它只负责「发现没有任何一轮在跑的时候重新拉起来」。
+# 接力监控：每一轮盯 5 小时 15 分后，由 watch.py 自己启动下一轮；
+# 启动不了（GitHub 接口出错）就一边接着盯盘一边重试，最多再撑 30 分钟（2026-11-25 事故后改）。
+# watch.py 撑不住时，最后的 hand-off 步骤再试几次。
+# 定时器只是保险——GitHub 的定时器经常晚几个小时才来，甚至几个小时不来，靠不住。
 on:
   workflow_dispatch:
     inputs:
@@ -19,7 +20,7 @@ on:
       budget_min:
         description: "这一轮跑多少分钟后交棒（测试时可以填小一点）"
         required: false
-        default: "330"
+        default: "315"
       levels:
         description: "dry 试跑用：临时改档位，如 0.5,1,2（留空=正式档位）"
         required: false
@@ -43,9 +44,17 @@ jobs:
       - name: Lock（已经有一轮在跑就退出）
         id: lock
         run: |
-          # 接力来的、试跑的，不用查。
-          if [ "$MODE" = "dry" ] || [ -n "$HANDOFF_FROM" ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
+          # 试跑的不用查。
+          if [ "$MODE" = "dry" ]; then echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          # 接力来的：只防一种情况——上一轮重试交棒时起了两轮。比自己早、又不是上一轮的接力轮还在跑，就让它，自己退出。
+          if [ -n "$HANDOFF_FROM" ]; then
+            prev=$(echo "$HANDOFF_FROM" | tr -cd '0-9'); prev=${prev:-0}
+            older=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/watch.yml/runs?per_page=40" \
+              --jq "[.workflow_runs[] | select(.status != \"completed\") | select(.id < $GITHUB_RUN_ID) | select(.id != $prev) | select((.display_title // \"\") | contains(\"接力\"))] | length" || echo 0)
+            older=${older:-0}
+            echo "更早的接力轮还在跑的: $older"
+            if [ "$older" -gt 0 ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; else echo "skip=false" >> "$GITHUB_OUTPUT"; fi
+            exit 0
           fi
           others=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/watch.yml/runs?per_page=40" \
             --jq "[.workflow_runs[] | select(.status != \"completed\") | select(.id != $GITHUB_RUN_ID) | select((.display_title // \"\") | contains(\"dry\") | not)] | length" || echo 0)
@@ -79,7 +88,7 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           OWNERS: ${{ secrets.OWNERS }}
           GITHUB_TOKEN: ${{ github.token }}
-          BUDGET_MIN: ${{ inputs.budget_min || '330' }}
+          BUDGET_MIN: ${{ inputs.budget_min || '315' }}
           LEVELS: ${{ inputs.levels }}
         run: |
           extra=""
@@ -87,13 +96,16 @@ jobs:
           python watch.py --mode "$MODE" --budget-min "$BUDGET_MIN" $extra
 
       - name: Hand off（启动下一轮）
+        id: handoff
         if: steps.lock.outputs.skip == 'false' && steps.watch.outcome == 'success' && env.MODE == 'live'
         run: |
+          # watch.py 交棒成功会留下 .handoff_done，这里就不用再起一轮。
+          if [ -f .handoff_done ]; then echo "watch.py 已经启动了下一轮"; exit 0; fi
           for attempt in 1 2 3; do
             if gh workflow run watch.yml --repo "$GITHUB_REPOSITORY" --ref main -f mode=live -f handoff_from="$GITHUB_RUN_ID"; then
               echo "已启动下一轮"; exit 0
             fi
-            sleep 20
+            sleep 30
           done
           echo "启动下一轮失败"; exit 1
 
@@ -102,6 +114,8 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WF_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/watch.yml
+          HANDOFF_OUTCOME: ${{ steps.handoff.outcome }}
         run: |
           # 一天只报第一次，免得连环失败刷屏。
           today=$(TZ=America/New_York date +%Y-%m-%d)
@@ -109,5 +123,10 @@ jobs:
           prior=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/watch.yml/runs?status=failure&created=%3E%3D$since&per_page=50" \
             --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID)] | length" || echo 0)
           if [ "${prior:-0}" -gt 0 ]; then echo "今天已经报过"; exit 0; fi
-          python3 -c 'import json,os; print(json.dumps({"text": "⚠️ 异动提醒这一轮运行失败，提醒可能中断（保险定时器会在 15 分钟左右重新拉起）：" + os.environ["RUN_URL"]}))' > payload.json
+          if [ "$HANDOFF_OUTCOME" = "failure" ]; then
+            MSG="⚠️ 异动提醒停了：这一轮重试了半个多小时，GitHub 一直不让启动下一轮。保险定时器会接着试，但它常常几个小时不来。请打开 $WF_URL 点 Run workflow 手动重启。出错记录：$RUN_URL"
+          else
+            MSG="⚠️ 异动提醒这一轮运行出错，可能中断。保险定时器会试着重新拉起，但它不准时；半小时后 Actions 里还没有正在跑的一轮，请打开 $WF_URL 点 Run workflow 手动重启。出错记录：$RUN_URL"
+          fi
+          python3 -c 'import json,os; print(json.dumps({"text": os.environ["MSG"]}))' > payload.json
           curl -sS -X POST -H 'Content-Type: application/json' --data @payload.json "$SLACK_WEBHOOK_URL" || true
