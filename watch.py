@@ -23,7 +23,7 @@
 为什么这么跑
 ------------
 旧版慢，是因为 GitHub 的定时器常常到下午才启动。现在改成接力：
-每一轮跑 5 个半小时，结束时自己启动下一轮（workflow 里的 hand-off 步骤），
+每一轮盯 5 小时 15 分后自己启动下一轮；启动不了就边盯盘边重试，最多再撑 30 分钟，
 定时器只当保险。非监控时段这一轮只是睡着等开盘。
 
 数据：Yahoo 报价接口，一次请求拿全部股票（含盘前盘后价、上一收盘价、财报时间）。
@@ -68,7 +68,9 @@ SLOW_WINDOW_DAYS = 5
 SLOW_CUM_PCT = 10.0
 SLOW_DAILY_CAP = 5.0
 SLOW_REPEAT_DAYS = 7                       # 同一只同方向几天内不重复提
-RUN_BUDGET_MIN = 330                       # 一轮跑多久后交棒（GitHub 单轮上限 6 小时）
+RUN_BUDGET_MIN = 315                       # 一轮跑多久后开始交棒（GitHub 单轮上限 6 小时）
+HANDOFF_GRACE_MIN = 30                     # 交棒没成功时，一边接着盯盘一边重试，最多再撑这么久
+HANDOFF_DONE_FILE = ".handoff_done"        # 交棒成功的标记，workflow 看到它就不再重复启动
 BAD_LOOPS_BEFORE_WARN = 5
 STATE_KEEP_DAYS = 12
 NEWS_MAX_AGE_H = 24
@@ -944,17 +946,78 @@ class Watcher:
             "warn gap")
 
     # ---- main loop
+    # ---- 交棒
+    def _gh(self, method: str, path: str, **kw):
+        repo, token = os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_TOKEN"]
+        return requests.request(method, f"https://api.github.com/repos/{repo}{path}",
+                                headers={"Authorization": f"Bearer {token}",
+                                         "Accept": "application/vnd.github+json"},
+                                timeout=30, **kw)
+
+    def successor_running(self) -> bool:
+        """下一轮是不是已经起来了（上次启动其实成功了、只是回话丢了，也算）。"""
+        me = int(os.environ.get("GITHUB_RUN_ID") or 0)
+        r = self._gh("GET", "/actions/workflows/watch.yml/runs",
+                     params={"event": "workflow_dispatch", "per_page": 10})
+        r.raise_for_status()
+        return any(run["id"] > me and "接力" in (run.get("display_title") or "")
+                   and run.get("status") != "completed"
+                   for run in r.json().get("workflow_runs", []))
+
+    def hand_off(self) -> bool:
+        """启动下一轮。成功（或发现下一轮已经在跑）返回 True。
+
+        2026-11-25 11:00 ET 交棒那一刻 GitHub 接口连回三次 500/502，旧做法一分钟内试三次就放弃，
+        保险定时器又四个多小时没来，监控停到 14:55。现在交棒挪进盯盘循环里：
+        到点后每隔一会儿试一次，没成功就接着盯盘，最多撑 HANDOFF_GRACE_MIN 分钟。
+        """
+        try:
+            self.save_accum(force=True)          # 交棒前把线外累计时长存一次，下一轮接着算
+        except Exception as e:
+            log(f"[warn] 交棒前存累计时长失败：{e}")
+        try:
+            if self.successor_running():
+                log("[info] 下一轮已经在跑了")
+                return True
+            r = self._gh("POST", "/actions/workflows/watch.yml/dispatches",
+                         json={"ref": "main", "inputs": {
+                             "mode": "live", "handoff_from": os.environ.get("GITHUB_RUN_ID", "")}})
+            if r.status_code in (200, 201, 204):
+                log("[info] 已启动下一轮")
+                return True
+            log(f"[warn] 启动下一轮失败：HTTP {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            log(f"[warn] 启动下一轮失败：{type(e).__name__}: {e}")
+        return False
+
+    def can_hand_off(self) -> bool:
+        return self.args.mode == "live" and all(
+            os.environ.get(k) for k in ("GITHUB_REPOSITORY", "GITHUB_TOKEN", "GITHUB_RUN_ID"))
+
     def run(self) -> int:
         started = time.time()
         budget_s = self.args.budget_min * 60
+        grace_end = budget_s + HANDOFF_GRACE_MIN * 60
         if self.args.mode == "dry":
             self.tick()
             log("[info] 试跑一轮完成")
             return 0
         prune_state(self.state, now_et().date())
         self.gap_notice()
-        last_idle_log = 0.0
-        while time.time() - started < budget_s:
+        last_idle_log, tries, next_try, handed = 0.0, 0, 0.0, False
+        while True:
+            elapsed = time.time() - started
+            if elapsed >= budget_s:
+                if not self.can_hand_off() or elapsed >= grace_end:
+                    break
+                if time.time() >= next_try:
+                    if tries == 0:
+                        log("[info] 这一轮时间到，交棒给下一轮")
+                    if self.hand_off():
+                        handed = True
+                        break
+                    tries += 1
+                    next_try = time.time() + min(60.0 * tries, 300.0)
             now = now_et()
             if in_window(now, self.cal):
                 t0 = time.time()
@@ -974,13 +1037,19 @@ class Watcher:
                 if time.time() - last_idle_log > 1800:
                     log(f"[idle] 不在监控时段，下一次开始：{nxt.strftime('%m/%d %H:%M')} ET")
                     last_idle_log = time.time()
-                left = budget_s - (time.time() - started)
-                time.sleep(max(1.0, min(wait, 300.0, left)))
-        try:
-            self.save_accum(force=True)      # 交棒前把线外累计时长存一次，下一轮接着算
-        except Exception as e:
-            log(f"[warn] 交棒前存累计时长失败：{e}")
-        log("[info] 这一轮时间到，交棒给下一轮")
+                elapsed = time.time() - started
+                until = budget_s - elapsed if elapsed < budget_s else max(0.0, next_try - time.time())
+                time.sleep(max(1.0, min(wait, 300.0, until)))
+        if handed:
+            Path(HANDOFF_DONE_FILE).write_text("ok")
+        elif self.can_hand_off():
+            log(f"[err] 重试了 {HANDOFF_GRACE_MIN} 分钟仍启动不了下一轮，交给 workflow 最后再试")
+        else:
+            try:
+                self.save_accum(force=True)
+            except Exception as e:
+                log(f"[warn] 存累计时长失败：{e}")
+            log("[info] 这一轮时间到")
         return 0
 
 
