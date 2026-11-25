@@ -20,6 +20,9 @@ class FakeCal:
     def prev(self, d):
         return [x for x in self.days if x < d][-1]
 
+    def next_on_or_after(self, d):
+        return ([x for x in self.days if x >= d] or [self.days[-1] + timedelta(days=3)])[0]
+
 
 CAL = FakeCal()
 
@@ -334,6 +337,110 @@ def test_held_stock_that_slips_back_waits_for_its_next_time_beyond():
     times = [t.strftime("%H:%M") for t, _ in sent]
     assert times == ["10:30", "11:10"], times    # 11:00 到点时乙不在线外，不发；回到线外再发
     assert "BBB" in sent[1][1]
+
+
+# ------------------------------------------------------- 交棒（2026-11-25 事故）
+def run_handoff(dispatch_codes, successor_after=None, budget_min=315):
+    """假时钟跑 Watcher.run 的交棒部分。
+
+    dispatch_codes：每次启动下一轮时 GitHub 回的状态码（用完后一直回最后一个）。
+    successor_after：第几次查的时候发现下一轮已经在跑（None = 一直没有）。
+    返回 (是否写了交棒标记, 启动尝试次数, 交棒期间盯盘了几次, 结束时这一轮跑了几分钟)。
+    """
+    import os
+    import tempfile
+    import types
+
+    clock = {"t": 0.0}
+    calls = {"post": 0, "get": 0, "tick": 0, "tick_after_budget": 0}
+
+    class Resp:
+        def __init__(self, code, body=None):
+            self.status_code, self._body, self.text = code, body or {}, ""
+
+        def json(self):
+            return self._body
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(self.status_code)
+
+    def gh(method, path, **kw):
+        if method == "GET":
+            calls["get"] += 1
+            runs = []
+            if successor_after is not None and calls["get"] >= successor_after:
+                runs = [{"id": 999, "display_title": "异动监控 live（接力）", "status": "queued"}]
+            return Resp(200, {"workflow_runs": runs})
+        calls["post"] += 1
+        return Resp(dispatch_codes[min(calls["post"], len(dispatch_codes)) - 1])
+
+    def tick():
+        calls["tick"] += 1
+        if clock["t"] >= budget_min * 60:
+            calls["tick_after_budget"] += 1
+
+    fake_time = types.SimpleNamespace(time=lambda: clock["t"],
+                                      sleep=lambda dt: clock.__setitem__("t", clock["t"] + dt))
+    saved = {k: getattr(w, k) for k in ("time", "now_et", "in_window", "prune_state", "log")}
+    env = {"GITHUB_REPOSITORY": "x/y", "GITHUB_TOKEN": "t", "GITHUB_RUN_ID": "100"}
+    old_env = {k: os.environ.get(k) for k in env}
+    old_cwd = os.getcwd()
+    tmp = tempfile.mkdtemp()
+    try:
+        w.time = fake_time
+        w.now_et = lambda: at(10, 0)
+        w.in_window = lambda _now, _cal: True
+        w.prune_state = lambda *_a: None
+        w.log = lambda *_a, **_k: None
+        os.environ.update(env)
+        os.chdir(tmp)
+        wt = object.__new__(w.Watcher)
+        wt.args = types.SimpleNamespace(mode="live", budget_min=budget_min)
+        wt.state, wt.cal, wt.symbols, wt.bad_loops = {}, FakeCal(), [], 0
+        wt.gap_notice = lambda: None
+        wt.save_accum = lambda force=False: None
+        wt._watchdog = lambda *_a: None
+        wt.tick = tick
+        wt._gh = gh
+        assert wt.run() == 0
+        done = os.path.exists(w.HANDOFF_DONE_FILE)
+    finally:
+        os.chdir(old_cwd)
+        for k, v in saved.items():
+            setattr(w, k, v)
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return done, calls["post"], calls["tick_after_budget"], clock["t"] / 60
+
+
+def test_handoff_succeeds_first_time():
+    done, posts, _, minutes = run_handoff([204])
+    assert done and posts == 1 and 315 <= minutes < 316, (done, posts, minutes)
+
+
+def test_handoff_keeps_watching_and_retrying_through_github_errors():
+    # 11/25 那次：GitHub 连回 502、500、500。现在不放弃，边盯盘边重试
+    done, posts, ticks, minutes = run_handoff([502, 500, 500, 500, 204])
+    assert done and posts == 5, (done, posts)
+    assert ticks >= 5, ticks                    # 重试期间照样在盯盘
+    assert minutes < 315 + w.HANDOFF_GRACE_MIN, minutes
+
+
+def test_handoff_counts_a_successor_that_already_started():
+    # 启动请求其实成功了、只是回话丢了：发现下一轮已经在跑，就别再起一轮
+    done, posts, _, _ = run_handoff([500], successor_after=2)
+    assert done and posts == 1, (done, posts)
+
+
+def test_handoff_gives_up_after_the_grace_period_and_leaves_no_marker():
+    done, posts, ticks, minutes = run_handoff([500])
+    assert not done and posts >= 6, (done, posts)
+    assert 315 + w.HANDOFF_GRACE_MIN <= minutes < 315 + w.HANDOFF_GRACE_MIN + 2, minutes
+    assert minutes + 1 + 3 < 355                # 加上装环境 1 分钟、workflow 再试 3 次，仍在 355 分钟上限内
 
 
 if __name__ == "__main__":
